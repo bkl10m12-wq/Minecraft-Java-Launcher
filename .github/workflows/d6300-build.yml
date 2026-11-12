@@ -1,9 +1,9 @@
-# Builds an installable "Zalith D6300" debug APK (arm64) in the cloud.
+# Builds an installable "Lumen Launcher" debug APK (arm64) in the cloud (based on Zalith Launcher).
 # It checks out ZalithLauncher/ZalithLauncher at a pinned commit, adds a small Rust
-# stability core + FPS-stability logger, flips a few performance-oriented defaults,
-# and builds the APK. Run it from the Actions tab (Run workflow).
+# stability core + FPS-stability logger + performance presets, flips a few performance-oriented
+# defaults, fixes the Minecraft 26.x native-dir launch crash, and builds the APK. Run it from the Actions tab (Run workflow).
 # License note: Zalith Launcher is GPL-3.0; if you share the APK, share this source too.
-name: Build Zalith D6300 (debug APK arm64)
+name: Build Lumen Launcher (debug APK arm64)
 
 on:
   workflow_dispatch:
@@ -462,7 +462,12 @@ jobs:
                       val dir = File(base, "stability")
                       dir.mkdirs()
                       val header = "Device: " + Build.MODEL + " / " + Build.HARDWARE + " / Android " + Build.VERSION.RELEASE
-                      File(dir, "$sessionName.txt").writeText(header + "\n" + summary + "\n")
+                      val presetLine = try {
+                          com.movtery.zalithlauncher.feature.preset.PerformancePreset.currentLabel()
+                      } catch (t: Throwable) {
+                          "Preset: unknown"
+                      }
+                      File(dir, "$sessionName.txt").writeText(header + "\n" + presetLine + "\n" + summary + "\n")
                       val csv = StringBuilder("second,fps\n")
                       for (i in copy.indices) csv.append(i + 1).append(',').append(copy[i]).append('\n')
                       File(dir, "$sessionName.csv").writeText(csv.toString())
@@ -524,6 +529,172 @@ jobs:
                   const val WARMUP_SECONDS = 20
                   const val SAVE_EVERY = 30
                   const val MIN_SAMPLES = 30
+              }
+          }
+          D6300_EOF
+          mkdir -p ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/preset
+          cat > ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/preset/PerformancePreset.kt <<'D6300_EOF'
+          package com.movtery.zalithlauncher.feature.preset
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.content.Context
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import com.movtery.zalithlauncher.R
+          import com.movtery.zalithlauncher.feature.log.Logging
+          import com.movtery.zalithlauncher.setting.AllSettings
+          import com.movtery.zalithlauncher.setting.AllStaticSettings
+          import com.movtery.zalithlauncher.setting.unit.StringSettingUnit
+          import java.io.File
+
+          /**
+           * Performance presets (Stable / Balanced / Max FPS).
+           *
+           * The numbers below are starting points chosen by reasoning (less rendered area and less world work
+           * means less GPU/CPU load). They are NOT measured on any phone. Use the stability log written by
+           * StabilityMonitor (it records the preset name) to compare them with A/B runs.
+           *
+           * Two parts:
+           *  1. launcher settings (render scale, V-Sync): written when the user picks a preset;
+           *  2. game options.txt keys (render distance etc.): written on the next game launch, only if the game
+           *     already created options.txt, and only once per selection (so in-game changes are not overwritten).
+           */
+          object PerformancePreset {
+              const val AUTO = "auto"
+              const val STABLE = "stable"
+              const val BALANCED = "balanced"
+              const val MAX_FPS = "max_fps"
+              const val CUSTOM = "custom"
+
+              private val presetUnit = StringSettingUnit("lumenPreset", CUSTOM)
+              private val effectiveUnit = StringSettingUnit("lumenPresetEffective", CUSTOM)
+              private val stampUnit = StringSettingUnit("lumenPresetStamp", "0")
+
+              private class Spec(
+                  val label: String,
+                  val resolution: Int,
+                  val vsync: Boolean,
+                  val renderDistance: Int,
+                  val simulationDistance: Int,
+                  val particles: Int,
+                  val graphicsMode: Int,
+                  val biomeBlend: Int,
+                  val maxFps: Int
+              )
+
+              // label, render scale %, V-Sync, render dist, simulation dist, particles (0 all..2 minimal),
+              // graphicsMode (0 fast), biome blend, max fps (260 = unlimited)
+              private val specs: Map<String, Spec> = mapOf(
+                  STABLE to Spec("Stable", 75, true, 6, 5, 2, 0, 1, 120),
+                  BALANCED to Spec("Balanced", 90, true, 8, 6, 1, 0, 2, 120),
+                  MAX_FPS to Spec("Max FPS", 60, false, 4, 5, 2, 0, 0, 260)
+              )
+
+              private fun totalRamMb(context: Context): Long {
+                  val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  val info = ActivityManager.MemoryInfo()
+                  am.getMemoryInfo(info)
+                  return info.totalMem / (1024L * 1024L)
+              }
+
+              /** Heuristic only: phones that report <= ~4.5 GB total RAM get Stable, others Balanced. */
+              fun suggestedKey(context: Context): String =
+                  if (totalRamMb(context) <= 4600L) STABLE else BALANCED
+
+              fun valueText(context: Context): String {
+                  val key = presetUnit.getValue()
+                  if (key == AUTO) return "Auto -> " + (specs[suggestedKey(context)]?.label ?: "?")
+                  return specs[key]?.label ?: "Custom (mere settings)"
+              }
+
+              /** One line for the stability report header, so every A/B run records what was active. */
+              @JvmStatic
+              fun currentLabel(): String =
+                  "Preset: " + presetUnit.getValue() + " (effective: " + effectiveUnit.getValue() + ")" +
+                      ", render scale " + AllSettings.resolutionRatio.getValue() + "%" +
+                      ", force V-Sync " + AllSettings.forceVsync.getValue()
+
+              fun applyPreset(context: Context, key: String) {
+                  val effective = if (key == AUTO) suggestedKey(context) else key
+                  val spec = specs[effective]
+                  val builder = presetUnit.put(key)
+                      .put(effectiveUnit, effective)
+                      .put(stampUnit, System.currentTimeMillis().toString())
+                  if (spec != null) {
+                      builder.put(AllSettings.resolutionRatio, spec.resolution)
+                          .put(AllSettings.forceVsync, spec.vsync)
+                  }
+                  builder.save()
+                  if (spec != null) AllStaticSettings.scaleFactor = spec.resolution / 100f
+              }
+
+              /** Called from LaunchArgs on every launch. Never throws. */
+              @JvmStatic
+              fun applyGameOptions(gameDir: File) {
+                  try {
+                      if (presetUnit.getValue() == CUSTOM) return
+                      val spec = specs[effectiveUnit.getValue()] ?: return
+                      val wanted = presetUnit.getValue() + "#" + stampUnit.getValue()
+                      val marker = File(gameDir, "lumen_preset.txt")
+                      if (marker.exists() && marker.readText().trim() == wanted) return
+                      // Only edit an options.txt the game itself already wrote (it contains the data version line);
+                      // a hand-made file could be mistaken for very old data by the game's data fixer.
+                      val optionsFile = File(gameDir, "options.txt")
+                      if (!optionsFile.isFile) return
+                      val lines = optionsFile.readLines().toMutableList()
+                      val values = linkedMapOf(
+                          "renderDistance" to spec.renderDistance.toString(),
+                          "simulationDistance" to spec.simulationDistance.toString(),
+                          "particles" to spec.particles.toString(),
+                          "graphicsMode" to spec.graphicsMode.toString(),
+                          "entityShadows" to "false",
+                          "biomeBlendRadius" to spec.biomeBlend.toString(),
+                          "maxFps" to spec.maxFps.toString(),
+                          "enableVsync" to spec.vsync.toString()
+                      )
+                      for ((k, v) in values) {
+                          val idx = lines.indexOfFirst { it.startsWith("$k:") }
+                          if (idx >= 0) lines[idx] = "$k:$v" else lines.add("$k:$v")
+                      }
+                      optionsFile.writeText(lines.joinToString("\n") + "\n")
+                      marker.writeText(wanted)
+                  } catch (e: Exception) {
+                      Logging.e("PerformancePreset", "Could not apply game options", e)
+                  }
+              }
+
+              private fun summary(context: Context, key: String): String {
+                  if (key == CUSTOM) return "Custom: koi preset nahi lagega, tumhare settings jaise hain waise rahenge."
+                  val effective = if (key == AUTO) suggestedKey(context) else key
+                  val s = specs[effective] ?: return "Preset set ho gaya."
+                  return s.label + ": render scale " + s.resolution + "%, V-Sync " + (if (s.vsync) "ON" else "OFF") +
+                      ". Game options (render distance " + s.renderDistance +
+                      " etc.) agle game launch se lagte hain, agar options.txt pehle se ban chuki ho."
+              }
+
+              fun showPicker(activity: Activity, onChanged: () -> Unit) {
+                  val keys = arrayOf(AUTO, STABLE, BALANCED, MAX_FPS, CUSTOM)
+                  val suggested = specs[suggestedKey(activity)]?.label ?: "?"
+                  val labels = arrayOf(
+                      "Auto (is device ke liye: $suggested)",
+                      "Stable: steady fps, kam load",
+                      "Balanced: thodi zyada quality",
+                      "Max FPS: sabse kam load, V-Sync off",
+                      "Custom: mere hi settings, kuch nahi badlega"
+                  )
+                  val index = keys.indexOf(presetUnit.getValue())
+                  val current = if (index < 0) keys.size - 1 else index
+                  AlertDialog.Builder(activity, R.style.CustomAlertDialogTheme)
+                      .setTitle("Performance preset")
+                      .setSingleChoiceItems(labels, current) { dialog, which ->
+                          applyPreset(activity, keys[which])
+                          Toast.makeText(activity, summary(activity, keys[which]), Toast.LENGTH_LONG).show()
+                          dialog.dismiss()
+                          onChanged()
+                      }
+                      .setPositiveButton(android.R.string.cancel, null)
+                      .show()
               }
           }
           D6300_EOF
@@ -598,11 +769,105 @@ jobs:
               "        super.onDestroy();\n        mMenuSettingsInitListener.closeSpinner();\n",
           )
 
+          # 2b. Minecraft 26.2+ launch fix ---------------------------------------------------
+          # Evidence (user's latestlog.txt, Minecraft 26.3): the version JSON now passes
+          #   -Djna.tmpdir / -Dorg.lwjgl.system.SharedLibraryExtractPath / -Dio.netty.native.workdir
+          # pointing at <natives_directory>/<sub>, and Zalith sets natives_directory to the app's
+          # read-only nativeLibraryDir (/data/app/...). 26.x creates those directories at startup ->
+          # AccessDeniedException, crash "Loading native libraries".
+          # The same log also shows a second -Djava.library.path (.../lib/arm64/java) that overrides the
+          # launcher's own one. Zalith Launcher 2 fixes both the same way (redirect to cache dir / force
+          # java.library.path to natives_directory), see its LaunchArgs.kt.
+          launch_args = MODULE / "src/main/java/com/movtery/zalithlauncher/launch/LaunchArgs.kt"
+          replace_once(
+              launch_args,
+              "        return JSONUtils.insertJSONValueList(minecraftArgs.toTypedArray<String>(), varArgMap)\n",
+              r'''        // Applied AFTER ${natives_directory} substitution, so it does not depend on the token form.
+                  val nativeDir = PathManager.DIR_NATIVE_LIB
+                  val cacheDir = PathManager.DIR_CACHE.absolutePath
+                  val writableDirProps = listOf(
+                      "-Djna.tmpdir=",
+                      "-Dorg.lwjgl.system.SharedLibraryExtractPath=",
+                      "-Dio.netty.native.workdir="
+                  )
+                  fun String.d6300FixNativePaths(): String {
+                      if (startsWith("-Djava.library.path=")) {
+                          // keep unexpected custom values; only fix paths inside the app lib dir (26.x: <lib>/java)
+                          return if (removePrefix("-Djava.library.path=").startsWith(nativeDir)) "-Djava.library.path=$nativeDir" else this
+                      }
+                      val prefix = writableDirProps.firstOrNull { startsWith(it) } ?: return this
+                      val path = removePrefix(prefix)
+                      if (!path.startsWith(nativeDir)) return this
+                      val redirected = cacheDir + path.removePrefix(nativeDir)
+                      File(redirected).mkdirs()
+                      return prefix + redirected
+                  }
+                  val resolved = JSONUtils.insertJSONValueList(minecraftArgs.toTypedArray<String>(), varArgMap)
+                  return resolved.map { it.d6300FixNativePaths() }.toTypedArray()
+          ''',
+          )
+
+          # 2c. Performance presets ---------------------------------------------------------
+          # New file PerformancePreset.kt is written by the workflow. Hooks:
+          #   - launch: write preset game options (options.txt) once per selection
+          #   - Video settings: one new row "Performance preset" that opens a picker dialog
+          replace_once(
+              launch_args,
+              "        argsList.addAll(getJavaArgs())\n",
+              "        com.movtery.zalithlauncher.feature.preset.PerformancePreset.applyGameOptions(gameDirPath)\n"
+              "        argsList.addAll(getJavaArgs())\n",
+          )
+
+          video_layout = MODULE / "src/main/res/layout/settings_fragment_video.xml"
+          renderer_row_anchor = (
+              '            <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout\n'
+              '                android:id="@+id/renderer_layout"\n'
+          )
+          preset_row = '''            <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout
+                          android:id="@+id/preset_layout"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:background="?android:attr/selectableItemBackground"
+                          android:padding="@dimen/_12sdp">
+
+                          <TextView
+                              android:id="@+id/preset_title"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:layout_alignParentStart="true"
+                              android:text="Performance preset"
+                              android:textColor="@color/black_or_white" />
+
+                          <TextView
+                              android:id="@+id/preset_value"
+                              android:layout_width="match_parent"
+                              android:layout_height="wrap_content"
+                              android:layout_below="@+id/preset_title"
+                              android:text="Custom" />
+                      </com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout>
+
+          '''
+          replace_once(video_layout, renderer_row_anchor, preset_row + renderer_row_anchor)
+
+          video_fragment = MODULE / "src/main/java/com/movtery/zalithlauncher/ui/fragment/settings/VideoSettingsFragment.kt"
+          replace_once(
+              video_fragment,
+              "        val renderers = Renderers.getCompatibleRenderers(context).first\n",
+              "        binding.presetValue.text = com.movtery.zalithlauncher.feature.preset.PerformancePreset.valueText(context)\n"
+              "        binding.presetLayout.setOnClickListener {\n"
+              "            com.movtery.zalithlauncher.feature.preset.PerformancePreset.showPicker(context) {\n"
+              "                binding.presetValue.text = com.movtery.zalithlauncher.feature.preset.PerformancePreset.valueText(context)\n"
+              "            }\n"
+              "        }\n"
+              "\n"
+              "        val renderers = Renderers.getCompatibleRenderers(context).first\n",
+          )
+
           # 3. App label ----------------------------------------------------------------
           replace_once(
               MODULE / "gradle.properties",
               "launcher_app_name=Zalith Launcher\n",
-              "launcher_app_name=Zalith D6300\n",
+              "launcher_app_name=Lumen Launcher\n",
           )
 
           print("D6300 patch applied.")
@@ -646,5 +911,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Zalith-D6300-debug-arm64
+          name: Lumen-Launcher-debug-arm64
           path: ZalithLauncher/build/outputs/apk/debug/*.apk
