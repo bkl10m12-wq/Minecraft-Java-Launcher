@@ -1,0 +1,650 @@
+# Builds an installable "Zalith D6300" debug APK (arm64) in the cloud.
+# It checks out ZalithLauncher/ZalithLauncher at a pinned commit, adds a small Rust
+# stability core + FPS-stability logger, flips a few performance-oriented defaults,
+# and builds the APK. Run it from the Actions tab (Run workflow).
+# License note: Zalith Launcher is GPL-3.0; if you share the APK, share this source too.
+name: Build Zalith D6300 (debug APK arm64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out Zalith Launcher (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ZalithLauncher/ZalithLauncher
+          ref: ed8a5c873b25f19d08aef5bdfc1084fd9aff836c
+
+      - name: Write D6300 source files
+        run: |
+          mkdir -p d6300-core
+          cat > d6300-core/Cargo.toml <<'D6300_EOF'
+          [package]
+          name = "d6300core"
+          version = "0.1.0"
+          edition = "2021"
+          description = "Frame-stability statistics core for the Zalith D6300 build (std only, no dependencies)"
+          license = "GPL-3.0-only"
+
+          [lib]
+          name = "d6300core"
+          crate-type = ["cdylib", "rlib"]
+
+          [profile.release]
+          opt-level = "s"
+          lto = true
+          panic = "abort"
+          strip = true
+          D6300_EOF
+          mkdir -p d6300-core/src
+          cat > d6300-core/src/lib.rs <<'D6300_EOF'
+          //! d6300core: frame-stability statistics for the Zalith D6300 build.
+          //!
+          //! The launcher samples the game's FPS counter once per second and pushes every
+          //! sample here. At the end of a session the launcher asks for a handful of
+          //! metrics that describe how *steady* the frame rate was, not just how high.
+          //!
+          //! No dependencies (std only). The JNI exports use plain primitives so no JNI
+          //! crate is needed.
+
+          use std::ffi::c_void;
+          use std::sync::Mutex;
+
+          /// Target band the user asked for (frames per second).
+          pub const BAND_LO: i32 = 69;
+          pub const BAND_HI: i32 = 90;
+
+          /// A sample below this fraction of the median counts as a "drop" (sudden stall).
+          pub const DROP_FRACTION: f64 = 0.6;
+
+          /// Fraction of the worst samples averaged for the "low" metric.
+          pub const LOW_FRACTION: f64 = 0.05;
+
+          #[derive(Debug, Clone, Copy, PartialEq)]
+          pub struct Stats {
+              pub count: usize,
+              pub avg: f64,
+              pub min: f64,
+              pub max: f64,
+              pub stdev: f64,
+              /// Mean of the worst 5% of samples.
+              pub low5: f64,
+              pub median: f64,
+              /// Percent of samples inside [BAND_LO, BAND_HI].
+              pub pct_in_band: f64,
+              /// Number of samples below DROP_FRACTION * median.
+              pub drops: usize,
+              /// 95th percentile minus 5th percentile: how wide the fps swings.
+              pub swing: f64,
+          }
+
+          impl Stats {
+              pub const EMPTY: Stats = Stats {
+                  count: 0,
+                  avg: 0.0,
+                  min: 0.0,
+                  max: 0.0,
+                  stdev: 0.0,
+                  low5: 0.0,
+                  median: 0.0,
+                  pct_in_band: 0.0,
+                  drops: 0,
+                  swing: 0.0,
+              };
+          }
+
+          /// Nearest-rank percentile on an already sorted slice (p in 0.0..=1.0).
+          fn percentile(sorted: &[i32], p: f64) -> f64 {
+              if sorted.is_empty() {
+                  return 0.0;
+              }
+              let rank = (p * sorted.len() as f64).ceil() as usize;
+              let idx = rank.clamp(1, sorted.len()) - 1;
+              sorted[idx] as f64
+          }
+
+          pub fn compute(samples: &[i32]) -> Stats {
+              let n = samples.len();
+              if n == 0 {
+                  return Stats::EMPTY;
+              }
+              let mut sorted: Vec<i32> = samples.to_vec();
+              sorted.sort_unstable();
+
+              let sum: f64 = sorted.iter().map(|&v| v as f64).sum();
+              let avg = sum / n as f64;
+              let var = sorted
+                  .iter()
+                  .map(|&v| {
+                      let d = v as f64 - avg;
+                      d * d
+                  })
+                  .sum::<f64>()
+                  / n as f64;
+
+              let k = ((LOW_FRACTION * n as f64).ceil() as usize).clamp(1, n);
+              let low5 = sorted[..k].iter().map(|&v| v as f64).sum::<f64>() / k as f64;
+
+              let median = percentile(&sorted, 0.5);
+              let in_band = sorted
+                  .iter()
+                  .filter(|&&v| v >= BAND_LO && v <= BAND_HI)
+                  .count();
+              let drop_limit = DROP_FRACTION * median;
+              let drops = sorted.iter().filter(|&&v| (v as f64) < drop_limit).count();
+
+              Stats {
+                  count: n,
+                  avg,
+                  min: sorted[0] as f64,
+                  max: sorted[n - 1] as f64,
+                  stdev: var.sqrt(),
+                  low5,
+                  median,
+                  pct_in_band: 100.0 * in_band as f64 / n as f64,
+                  drops,
+                  swing: percentile(&sorted, 0.95) - percentile(&sorted, 0.05),
+              }
+          }
+
+          // ---------------------------------------------------------------------------
+          // Session state + JNI surface
+          // ---------------------------------------------------------------------------
+
+          static SESSION: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+          fn with_session<R>(f: impl FnOnce(&mut Vec<i32>) -> R) -> R {
+              let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+              f(&mut guard)
+          }
+
+          /// Metric ids, shared with the Kotlin side (NativeStability.kt).
+          pub const M_COUNT: i32 = 0;
+          pub const M_AVG: i32 = 1;
+          pub const M_MIN: i32 = 2;
+          pub const M_MAX: i32 = 3;
+          pub const M_STDEV: i32 = 4;
+          pub const M_LOW5: i32 = 5;
+          pub const M_MEDIAN: i32 = 6;
+          pub const M_PCT_IN_BAND: i32 = 7;
+          pub const M_DROPS: i32 = 8;
+          pub const M_SWING: i32 = 9;
+
+          pub fn metric(stats: &Stats, id: i32) -> f64 {
+              match id {
+                  M_COUNT => stats.count as f64,
+                  M_AVG => stats.avg,
+                  M_MIN => stats.min,
+                  M_MAX => stats.max,
+                  M_STDEV => stats.stdev,
+                  M_LOW5 => stats.low5,
+                  M_MEDIAN => stats.median,
+                  M_PCT_IN_BAND => stats.pct_in_band,
+                  M_DROPS => stats.drops as f64,
+                  M_SWING => stats.swing,
+                  _ => 0.0,
+              }
+          }
+
+          #[no_mangle]
+          pub extern "system" fn Java_com_movtery_zalithlauncher_feature_stability_NativeStability_nativeReset(
+              _env: *mut c_void,
+              _class: *mut c_void,
+          ) {
+              with_session(|v| v.clear());
+          }
+
+          #[no_mangle]
+          pub extern "system" fn Java_com_movtery_zalithlauncher_feature_stability_NativeStability_nativePush(
+              _env: *mut c_void,
+              _class: *mut c_void,
+              fps: i32,
+          ) {
+              // Keep memory bounded: 6 hours at one sample per second.
+              with_session(|v| {
+                  if v.len() < 21_600 {
+                      v.push(fps);
+                  }
+              });
+          }
+
+          #[no_mangle]
+          pub extern "system" fn Java_com_movtery_zalithlauncher_feature_stability_NativeStability_nativeMetric(
+              _env: *mut c_void,
+              _class: *mut c_void,
+              id: i32,
+          ) -> f64 {
+              let stats = with_session(|v| compute(v));
+              metric(&stats, id)
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn empty_is_all_zero() {
+                  assert_eq!(compute(&[]), Stats::EMPTY);
+              }
+
+              #[test]
+              fn steady_signal_has_no_swing_or_drops() {
+                  let s = compute(&vec![80; 100]);
+                  assert_eq!(s.count, 100);
+                  assert!((s.avg - 80.0).abs() < 1e-9);
+                  assert!(s.stdev < 1e-9);
+                  assert_eq!(s.swing, 0.0);
+                  assert_eq!(s.drops, 0);
+                  assert!((s.low5 - 80.0).abs() < 1e-9);
+                  assert!((s.pct_in_band - 100.0).abs() < 1e-9);
+              }
+
+              #[test]
+              fn sudden_drop_is_counted_and_pulls_low5_down() {
+                  // 95 steady seconds at 85 fps plus 5 seconds at 4 fps (the 91 -> 3-4 fps stalls).
+                  let mut v = vec![85; 95];
+                  v.extend(vec![4; 5]);
+                  let s = compute(&v);
+                  assert_eq!(s.drops, 5);
+                  assert!((s.low5 - 4.0).abs() < 1e-9, "low5 was {}", s.low5);
+                  assert!(s.avg > 80.0, "average hides the stalls: {}", s.avg);
+                  assert_eq!(s.min, 4.0);
+                  assert_eq!(s.max, 85.0);
+                  assert!((s.pct_in_band - 95.0).abs() < 1e-9);
+              }
+
+              #[test]
+              fn fluctuation_shows_up_in_swing_and_stdev() {
+                  let steady = compute(&[78, 80, 79, 81, 80, 78, 82, 80, 79, 81]);
+                  let wobbly = compute(&[140, 60, 120, 55, 135, 65, 130, 50, 125, 70]);
+                  assert!(wobbly.swing > steady.swing + 40.0);
+                  assert!(wobbly.stdev > steady.stdev * 5.0);
+                  assert!(wobbly.pct_in_band < steady.pct_in_band);
+              }
+
+              #[test]
+              fn percentile_is_nearest_rank() {
+                  let sorted = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                  assert_eq!(percentile(&sorted, 0.5), 5.0);
+                  assert_eq!(percentile(&sorted, 0.95), 10.0);
+                  assert_eq!(percentile(&sorted, 0.05), 1.0);
+                  assert_eq!(percentile(&sorted, 0.0), 1.0);
+              }
+
+              #[test]
+              fn low5_uses_at_least_one_sample() {
+                  let s = compute(&[10, 90, 90, 90]);
+                  assert!((s.low5 - 10.0).abs() < 1e-9);
+              }
+
+              #[test]
+              fn jni_surface_roundtrip() {
+                  use std::ptr::null_mut;
+                  let name_reset = Java_com_movtery_zalithlauncher_feature_stability_NativeStability_nativeReset;
+                  let name_push = Java_com_movtery_zalithlauncher_feature_stability_NativeStability_nativePush;
+                  let name_metric = Java_com_movtery_zalithlauncher_feature_stability_NativeStability_nativeMetric;
+                  name_reset(null_mut(), null_mut());
+                  for v in [70, 80, 90, 80] {
+                      name_push(null_mut(), null_mut(), v);
+                  }
+                  assert_eq!(name_metric(null_mut(), null_mut(), M_COUNT), 4.0);
+                  assert_eq!(name_metric(null_mut(), null_mut(), M_AVG), 80.0);
+                  assert_eq!(name_metric(null_mut(), null_mut(), M_MIN), 70.0);
+                  assert_eq!(name_metric(null_mut(), null_mut(), 99), 0.0);
+                  name_reset(null_mut(), null_mut());
+                  assert_eq!(name_metric(null_mut(), null_mut(), M_COUNT), 0.0);
+              }
+          }
+          D6300_EOF
+          mkdir -p ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/stability
+          cat > ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/stability/NativeStability.kt <<'D6300_EOF'
+          package com.movtery.zalithlauncher.feature.stability
+
+          /**
+           * JNI bridge to libd6300core.so (Rust, std only).
+           * The library is optional: if it is not packaged or fails to load, [available] stays false
+           * and the launcher falls back to a simple Kotlin summary.
+           */
+          object NativeStability {
+              const val M_COUNT = 0
+              const val M_AVG = 1
+              const val M_MIN = 2
+              const val M_MAX = 3
+              const val M_STDEV = 4
+              const val M_LOW5 = 5
+              const val M_MEDIAN = 6
+              const val M_PCT_IN_BAND = 7
+              const val M_DROPS = 8
+              const val M_SWING = 9
+
+              @Volatile
+              var available: Boolean = false
+                  private set
+
+              init {
+                  available = try {
+                      System.loadLibrary("d6300core")
+                      true
+                  } catch (t: Throwable) {
+                      false
+                  }
+              }
+
+              @JvmStatic
+              external fun nativeReset()
+
+              @JvmStatic
+              external fun nativePush(fps: Int)
+
+              @JvmStatic
+              external fun nativeMetric(id: Int): Double
+          }
+          D6300_EOF
+          mkdir -p ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/stability
+          cat > ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/stability/StabilityMonitor.kt <<'D6300_EOF'
+          package com.movtery.zalithlauncher.feature.stability
+
+          import android.content.Context
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import android.widget.Toast
+          import org.lwjgl.glfw.CallbackBridge
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /**
+           * Samples the game's FPS counter once per second while a game is running and writes a
+           * stability report (average, worst-5% average, swing, drops, time in the 69-90 fps band).
+           *
+           * Files go to <app external files dir>/stability/session_<time>.txt and .csv and are
+           * rewritten every [SAVE_EVERY] samples, so data survives if the process is killed.
+           * The FPS counter itself updates once per second (see calculateFPS in egl_bridge.c), so this
+           * measures per-second fps, not individual frame times.
+           */
+          class StabilityMonitor(context: Context) {
+              private val appContext: Context = context.applicationContext
+              private val samples = ArrayList<Int>()
+
+              @Volatile
+              private var running = false
+              private var worker: Thread? = null
+              private var nativeOk: Boolean = NativeStability.available
+              private val sessionName: String =
+                  "session_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
+              fun start() {
+                  if (running) return
+                  running = true
+                  if (nativeOk) {
+                      try {
+                          NativeStability.nativeReset()
+                      } catch (t: Throwable) {
+                          nativeOk = false
+                      }
+                  }
+                  val t = Thread({ loop() }, "d6300-stability")
+                  t.isDaemon = true
+                  worker = t
+                  t.start()
+              }
+
+              fun stop() {
+                  if (!running) return
+                  running = false
+                  worker?.interrupt()
+                  val summary = saveReport()
+                  if (summary != null) {
+                      Log.i(TAG, summary)
+                      Handler(Looper.getMainLooper()).post {
+                          try {
+                              Toast.makeText(appContext, summary, Toast.LENGTH_LONG).show()
+                          } catch (t: Throwable) {
+                              // best effort only
+                          }
+                      }
+                  }
+              }
+
+              private fun loop() {
+                  var warmup = WARMUP_SECONDS
+                  var started = false
+                  var sinceSave = 0
+                  while (running) {
+                      try {
+                          Thread.sleep(1000L)
+                      } catch (e: InterruptedException) {
+                          break
+                      }
+                      val fps = try {
+                          CallbackBridge.getCurrentFps()
+                      } catch (t: Throwable) {
+                          0
+                      }
+                      if (!started) {
+                          if (fps <= 0) continue
+                          started = true
+                      }
+                      if (warmup > 0) {
+                          warmup--
+                          continue
+                      }
+                      synchronized(samples) { samples.add(fps) }
+                      if (nativeOk) {
+                          try {
+                              NativeStability.nativePush(fps)
+                          } catch (t: Throwable) {
+                              nativeOk = false
+                          }
+                      }
+                      sinceSave++
+                      if (sinceSave >= SAVE_EVERY) {
+                          sinceSave = 0
+                          saveReport()
+                      }
+                  }
+              }
+
+              @Synchronized
+              private fun saveReport(): String? {
+                  val copy: List<Int> = synchronized(samples) { ArrayList(samples) }
+                  if (copy.size < MIN_SAMPLES) return null
+                  val summary = buildSummary(copy)
+                  try {
+                      val base = appContext.getExternalFilesDir(null) ?: return summary
+                      val dir = File(base, "stability")
+                      dir.mkdirs()
+                      val header = "Device: " + Build.MODEL + " / " + Build.HARDWARE + " / Android " + Build.VERSION.RELEASE
+                      File(dir, "$sessionName.txt").writeText(header + "\n" + summary + "\n")
+                      val csv = StringBuilder("second,fps\n")
+                      for (i in copy.indices) csv.append(i + 1).append(',').append(copy[i]).append('\n')
+                      File(dir, "$sessionName.csv").writeText(csv.toString())
+                  } catch (t: Throwable) {
+                      Log.w(TAG, "Could not write stability report", t)
+                  }
+                  return summary
+              }
+
+              private fun buildSummary(copy: List<Int>): String {
+                  if (nativeOk) {
+                      try {
+                          return formatNative(copy.size)
+                      } catch (t: Throwable) {
+                          nativeOk = false
+                      }
+                  }
+                  return formatFallback(copy)
+              }
+
+              private fun f1(x: Double): String = String.format(Locale.US, "%.1f", x)
+              private fun f0(x: Double): String = String.format(Locale.US, "%.0f", x)
+
+              private fun formatNative(count: Int): String {
+                  val avg = NativeStability.nativeMetric(NativeStability.M_AVG)
+                  val median = NativeStability.nativeMetric(NativeStability.M_MEDIAN)
+                  val low5 = NativeStability.nativeMetric(NativeStability.M_LOW5)
+                  val min = NativeStability.nativeMetric(NativeStability.M_MIN)
+                  val max = NativeStability.nativeMetric(NativeStability.M_MAX)
+                  val sd = NativeStability.nativeMetric(NativeStability.M_STDEV)
+                  val swing = NativeStability.nativeMetric(NativeStability.M_SWING)
+                  val band = NativeStability.nativeMetric(NativeStability.M_PCT_IN_BAND)
+                  val drops = NativeStability.nativeMetric(NativeStability.M_DROPS)
+                  return "Samples: $count s (first $WARMUP_SECONDS s skipped)\n" +
+                      "Average " + f1(avg) + " fps, median " + f1(median) + "\n" +
+                      "Worst-5% average " + f1(low5) + " fps (min " + f0(min) + ", max " + f0(max) + ")\n" +
+                      "Std dev " + f1(sd) + ", swing " + f0(swing) + " fps (p95-p5)\n" +
+                      "Time in 69-90 fps band: " + f0(band) + " percent\n" +
+                      "Sudden drops: " + f0(drops) + " s"
+              }
+
+              private fun formatFallback(copy: List<Int>): String {
+                  var sum = 0L
+                  var min = Int.MAX_VALUE
+                  var max = Int.MIN_VALUE
+                  for (v in copy) {
+                      sum += v
+                      if (v < min) min = v
+                      if (v > max) max = v
+                  }
+                  val avg = sum.toDouble() / copy.size
+                  return "Samples: " + copy.size + " s (first $WARMUP_SECONDS s skipped)\n" +
+                      "Average " + f1(avg) + " fps (min " + min + ", max " + max + ")\n" +
+                      "(Rust core not loaded: basic summary only)"
+              }
+
+              private companion object {
+                  const val TAG = "D6300Stability"
+                  const val WARMUP_SECONDS = 20
+                  const val SAVE_EVERY = 30
+                  const val MIN_SAMPLES = 30
+              }
+          }
+          D6300_EOF
+          mkdir -p .
+          cat > apply_d6300.py <<'D6300_EOF'
+          #!/usr/bin/env python3
+          """Apply the Zalith D6300 patch to a checkout of ZalithLauncher/ZalithLauncher.
+
+          Run from the repository root. Every edit asserts that its anchor text exists exactly
+          once, so the script fails loudly instead of silently producing a half-patched tree.
+
+          Edits:
+            1. defaults in AllSettings.kt  (stability-oriented defaults for low-end Mali phones)
+            2. MainActivity.java            (start/stop the StabilityMonitor)
+            3. gradle.properties            (app label, so it is easy to tell apart)
+          The new Kotlin files and the Rust crate are written by the workflow before this runs.
+          """
+          import pathlib
+          import sys
+
+          ROOT = pathlib.Path(".")
+          MODULE = ROOT / "ZalithLauncher"
+
+
+          def replace_once(path: pathlib.Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  sys.exit(f"PATCH FAILED: expected 1 match in {path}, found {count} for: {old!r}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print(f"patched {path}: {old!r}")
+
+
+          # 1. Defaults ---------------------------------------------------------------
+          settings = MODULE / "src/main/java/com/movtery/zalithlauncher/setting/AllSettings.kt"
+          for key, name in [
+              ("sustainedPerformance", "sustainedPerformance"),
+              ("alternate_surface", "alternate_surface"),
+              ("force_vsync", "force_vsync"),
+              ("gameMenuShowFPS", "gameMenuShowFPS"),
+              # (see comment below about bigCoreAffinity)
+              # bigCoreAffinity is deliberately NOT changed: at this upstream commit the env var
+              # POJAV_BIG_CORE_AFFINITY is set but nothing in the native code reads it.
+          ]:
+              replace_once(settings, f'BooleanSettingUnit("{key}", false)', f'BooleanSettingUnit("{key}", true)')
+
+          # 2. MainActivity hooks -------------------------------------------------------
+          main = MODULE / "src/main/java/net/kdt/pojavlaunch/MainActivity.java"
+          replace_once(
+              main,
+              "import org.greenrobot.eventbus.EventBus;\n",
+              "import org.greenrobot.eventbus.EventBus;\n"
+              "import com.movtery.zalithlauncher.feature.stability.StabilityMonitor;\n",
+          )
+          replace_once(
+              main,
+              "    private GameMenuViewWrapper mGameMenuWrapper;\n",
+              "    private GameMenuViewWrapper mGameMenuWrapper;\n"
+              "    private StabilityMonitor mStabilityMonitor;\n",
+          )
+          replace_once(
+              main,
+              "        CallbackBridge.addGrabListener(binding.mainTouchpad);\n",
+              "        CallbackBridge.addGrabListener(binding.mainTouchpad);\n"
+              "        mStabilityMonitor = new StabilityMonitor(this);\n"
+              "        mStabilityMonitor.start();\n",
+          )
+          replace_once(
+              main,
+              "        super.onDestroy();\n        mMenuSettingsInitListener.closeSpinner();\n",
+              "        if (mStabilityMonitor != null) mStabilityMonitor.stop();\n"
+              "        super.onDestroy();\n        mMenuSettingsInitListener.closeSpinner();\n",
+          )
+
+          # 3. App label ----------------------------------------------------------------
+          replace_once(
+              MODULE / "gradle.properties",
+              "launcher_app_name=Zalith Launcher\n",
+              "launcher_app_name=Zalith D6300\n",
+          )
+
+          print("D6300 patch applied.")
+          D6300_EOF
+
+      - name: Apply D6300 patch
+        run: python3 apply_d6300.py
+
+      - name: Build Rust stability core (optional, APK still builds if this fails)
+        continue-on-error: true
+        run: |
+          set -e
+          rustup target add aarch64-linux-android
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then NDK="$(ls -d "$ANDROID_SDK_ROOT"/ndk/* | sort -V | tail -1)"; fi
+          echo "Using NDK: $NDK"
+          TOOLBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLBIN/aarch64-linux-android26-clang"
+          (cd d6300-core && cargo test --release && cargo build --release --target aarch64-linux-android)
+          mkdir -p ZalithLauncher/src/main/jniLibs/arm64-v8a
+          cp d6300-core/target/aarch64-linux-android/release/libd6300core.so ZalithLauncher/src/main/jniLibs/arm64-v8a/
+          ls -l ZalithLauncher/src/main/jniLibs/arm64-v8a/
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build JRE JAR files
+        run: |
+          chmod +x gradlew
+          mkdir out
+          ./gradlew jre_lwjgl3glfw:build --no-daemon
+
+      - name: Build debug APK (arm64)
+        run: |
+          chmod +x gradlew
+          ./gradlew ZalithLauncher:assembleDebug -Darch=arm64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zalith-D6300-debug-arm64
+          path: ZalithLauncher/build/outputs/apk/debug/*.apk
