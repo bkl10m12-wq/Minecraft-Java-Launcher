@@ -352,6 +352,7 @@ jobs:
           import android.os.Build
           import android.os.Handler
           import android.os.Looper
+          import android.os.PowerManager
           import android.util.Log
           import android.widget.Toast
           import org.lwjgl.glfw.CallbackBridge
@@ -364,6 +365,13 @@ jobs:
            * Samples the game's FPS counter once per second while a game is running and writes a
            * stability report (average, worst-5% average, swing, drops, time in the 69-90 fps band).
            *
+           * v2 also records WHY fps collapses, using only files/APIs an app may read:
+           *  - memory: MemAvailable (system), VmRSS and VmSwap of this process (swap = zram/virtual RAM use)
+           *  - thermal status (PowerManager, Android 10+)
+           *  - which threads burn CPU (/proc/self/task/<tid>/stat; the game JVM runs inside this process)
+           *  - how long fps stayed at or below 5 (stall time)
+           * Values that the phone does not allow reading show up as n/a.
+           *
            * Files go to <app external files dir>/stability/session_<time>.txt and .csv and are
            * rewritten every [SAVE_EVERY] samples, so data survives if the process is killed.
            * The FPS counter itself updates once per second (see calculateFPS in egl_bridge.c), so this
@@ -372,6 +380,7 @@ jobs:
           class StabilityMonitor(context: Context) {
               private val appContext: Context = context.applicationContext
               private val samples = ArrayList<Int>()
+              private val sysSamples = ArrayList<LongArray>() // [availMb, rssMb, swapMb, thermal] per fps sample
 
               @Volatile
               private var running = false
@@ -379,6 +388,16 @@ jobs:
               private var nativeOk: Boolean = NativeStability.available
               private val sessionName: String =
                   "session_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+              private val startedAtMs: Long = System.currentTimeMillis()
+
+              @Volatile
+              private var firstFrameSeconds: Long = -1L
+
+              // per-thread CPU accounting (ticks of /proc/self/task/<tid>/stat)
+              private val prevTicks = HashMap<String, Long>()
+              private val cpuByName = HashMap<String, Long>()
+              private var totalTicks = 0L
+              private var threadSampleSeconds = 0L
 
               fun start() {
                   if (running) return
@@ -417,12 +436,15 @@ jobs:
                   var warmup = WARMUP_SECONDS
                   var started = false
                   var sinceSave = 0
+                  var elapsed = 0L
                   while (running) {
                       try {
                           Thread.sleep(1000L)
                       } catch (e: InterruptedException) {
                           break
                       }
+                      elapsed++
+                      if (elapsed % THREAD_SAMPLE_EVERY == 0L) sampleThreads()
                       val fps = try {
                           CallbackBridge.getCurrentFps()
                       } catch (t: Throwable) {
@@ -431,12 +453,17 @@ jobs:
                       if (!started) {
                           if (fps <= 0) continue
                           started = true
+                          firstFrameSeconds = (System.currentTimeMillis() - startedAtMs) / 1000L
                       }
                       if (warmup > 0) {
                           warmup--
                           continue
                       }
-                      synchronized(samples) { samples.add(fps) }
+                      val sys = readSystemSample()
+                      synchronized(samples) {
+                          samples.add(fps)
+                          sysSamples.add(sys)
+                      }
                       if (nativeOk) {
                           try {
                               NativeStability.nativePush(fps)
@@ -452,9 +479,137 @@ jobs:
                   }
               }
 
+              // ---- diagnostics -------------------------------------------------------------------
+
+              /** Reads "<key>   123 kB" style lines; returns kB or -1 when unreadable. */
+              private fun readKb(path: String, key: String): Long {
+                  return try {
+                      File(path).useLines { lines ->
+                          var found = -1L
+                          for (line in lines) {
+                              if (line.startsWith(key)) {
+                                  found = line.substring(key.length).trim().split(" ")[0].toLongOrNull() ?: -1L
+                                  break
+                              }
+                          }
+                          found
+                      }
+                  } catch (t: Throwable) {
+                      -1L
+                  }
+              }
+
+              private fun kbToMb(kb: Long): Long = if (kb < 0L) -1L else kb / 1024L
+
+              private fun thermalStatus(): Long {
+                  return try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+                          pm.currentThermalStatus.toLong()
+                      } else {
+                          -1L
+                      }
+                  } catch (t: Throwable) {
+                      -1L
+                  }
+              }
+
+              private fun readSystemSample(): LongArray {
+                  val avail = kbToMb(readKb("/proc/meminfo", "MemAvailable:"))
+                  val rss = kbToMb(readKb("/proc/self/status", "VmRSS:"))
+                  val swap = kbToMb(readKb("/proc/self/status", "VmSwap:"))
+                  return longArrayOf(avail, rss, swap, thermalStatus())
+              }
+
+              /** Adds the CPU ticks every thread of this process used since the last call. */
+              private fun sampleThreads() {
+                  try {
+                      val tasks = File("/proc/self/task").listFiles() ?: return
+                      for (task in tasks) {
+                          val text = runCatching { File(task, "stat").readText() }.getOrNull() ?: continue
+                          val open = text.indexOf('(')
+                          val close = text.lastIndexOf(')')
+                          if (open < 0 || close < open || close + 2 > text.length) continue
+                          val name = text.substring(open + 1, close)
+                          // after ") ": state(0) ppid(1) ... utime is field 14 -> index 11, stime index 12
+                          val rest = text.substring(close + 2).split(" ")
+                          val ut = rest.getOrNull(11)?.toLongOrNull() ?: continue
+                          val st = rest.getOrNull(12)?.toLongOrNull() ?: continue
+                          val ticks = ut + st
+                          val before = prevTicks.put(task.name, ticks)
+                          if (before != null && ticks >= before) {
+                              val delta = ticks - before
+                              cpuByName[name] = (cpuByName[name] ?: 0L) + delta
+                              totalTicks += delta
+                          }
+                      }
+                      threadSampleSeconds += THREAD_SAMPLE_EVERY
+                  } catch (t: Throwable) {
+                      // diagnostics only
+                  }
+              }
+
+              private fun buildDiagnostics(copy: List<Int>, sys: List<LongArray>): String {
+                  val sb = StringBuilder("\n--- Diagnostics (kyun fps gira) ---\n")
+                  sb.append("First frame after ").append(if (firstFrameSeconds >= 0L) firstFrameSeconds.toString() + " s" else "n/a")
+                      .append(" (splash screen, world load nahi)\n")
+
+                  var lowSeconds = 0
+                  var longest = 0
+                  var streak = 0
+                  for (v in copy) {
+                      if (v <= 5) {
+                          lowSeconds++
+                          streak++
+                          if (streak > longest) longest = streak
+                      } else {
+                          streak = 0
+                      }
+                  }
+                  sb.append("Seconds with fps <= 5: ").append(lowSeconds).append(" of ").append(copy.size)
+                      .append(", longest stall ").append(longest).append(" s\n")
+
+                  var minAvail = Long.MAX_VALUE
+                  var maxRss = -1L
+                  var maxSwap = -1L
+                  var maxThermal = -1L
+                  for (s in sys) {
+                      if (s[0] >= 0L && s[0] < minAvail) minAvail = s[0]
+                      if (s[1] > maxRss) maxRss = s[1]
+                      if (s[2] > maxSwap) maxSwap = s[2]
+                      if (s[3] > maxThermal) maxThermal = s[3]
+                  }
+                  sb.append("Lowest free RAM (MemAvailable): ")
+                      .append(if (minAvail == Long.MAX_VALUE) "n/a" else minAvail.toString() + " MB").append('\n')
+                  sb.append("Game process RAM max (RSS): ").append(if (maxRss >= 0L) maxRss.toString() + " MB" else "n/a")
+                      .append(", swapped out max (VmSwap): ").append(if (maxSwap >= 0L) maxSwap.toString() + " MB" else "n/a").append('\n')
+                  sb.append("Thermal status max (0 none .. 3 severe .. 6 shutdown): ")
+                      .append(if (maxThermal >= 0L) maxThermal.toString() else "n/a").append('\n')
+
+                  if (totalTicks > 0L && threadSampleSeconds > 0L) {
+                      val cores = totalTicks / 100.0 / threadSampleSeconds
+                      sb.append("Average CPU use by the game process: ").append(f1(cores)).append(" cores of 8\n")
+                      sb.append("Top threads by CPU:\n")
+                      val top = cpuByName.entries.sortedByDescending { it.value }.take(8)
+                      for (e in top) {
+                          val pct = e.value * 100.0 / totalTicks
+                          sb.append("  ").append(e.key).append(": ").append(f1(pct)).append(" percent\n")
+                      }
+                  } else {
+                      sb.append("Thread CPU: n/a\n")
+                  }
+                  return sb.toString()
+              }
+
+              // ---- report ------------------------------------------------------------------------
+
               @Synchronized
               private fun saveReport(): String? {
-                  val copy: List<Int> = synchronized(samples) { ArrayList(samples) }
+                  val snapshot = synchronized(samples) {
+                      Pair(ArrayList(samples), ArrayList(sysSamples))
+                  }
+                  val copy: List<Int> = snapshot.first
+                  val sysCopy: List<LongArray> = snapshot.second
                   if (copy.size < MIN_SAMPLES) return null
                   val summary = buildSummary(copy)
                   try {
@@ -467,9 +622,21 @@ jobs:
                       } catch (t: Throwable) {
                           "Preset: unknown"
                       }
-                      File(dir, "$sessionName.txt").writeText(header + "\n" + presetLine + "\n" + summary + "\n")
-                      val csv = StringBuilder("second,fps\n")
-                      for (i in copy.indices) csv.append(i + 1).append(',').append(copy[i]).append('\n')
+                      val diag = try {
+                          buildDiagnostics(copy, sysCopy)
+                      } catch (t: Throwable) {
+                          "\nDiagnostics failed: " + t.javaClass.simpleName + "\n"
+                      }
+                      File(dir, "$sessionName.txt").writeText(header + "\n" + presetLine + "\n" + summary + "\n" + diag)
+                      val csv = StringBuilder("second,fps,free_ram_mb,game_rss_mb,game_swap_mb,thermal\n")
+                      for (i in copy.indices) {
+                          csv.append(i + 1).append(',').append(copy[i])
+                          val s = if (i < sysCopy.size) sysCopy[i] else null
+                          if (s != null) {
+                              for (v in s) csv.append(',').append(v)
+                          }
+                          csv.append('\n')
+                      }
                       File(dir, "$sessionName.csv").writeText(csv.toString())
                   } catch (t: Throwable) {
                       Log.w(TAG, "Could not write stability report", t)
@@ -529,6 +696,7 @@ jobs:
                   const val WARMUP_SECONDS = 20
                   const val SAVE_EVERY = 30
                   const val MIN_SAMPLES = 30
+                  const val THREAD_SAMPLE_EVERY = 3L
               }
           }
           D6300_EOF
@@ -549,16 +717,18 @@ jobs:
           import java.io.File
 
           /**
-           * Performance presets (Stable / Balanced / Max FPS).
+           * Performance presets (Stable / Balanced / Max FPS) and the optional JVM garbage-collector mode.
            *
-           * The numbers below are starting points chosen by reasoning (less rendered area and less world work
-           * means less GPU/CPU load). They are NOT measured on any phone. Use the stability log written by
-           * StabilityMonitor (it records the preset name) to compare them with A/B runs.
+           * Presets NEVER change the render resolution (the first Lumen build did, which made the picture blurry;
+           * [restoreResolutionOnce] undoes that). They only touch V-Sync and a few game options.txt keys
+           * (render distance, simulation distance, particles, ...), which lowers world/GPU work without
+           * lowering picture sharpness.
            *
-           * Two parts:
-           *  1. launcher settings (render scale, V-Sync): written when the user picks a preset;
-           *  2. game options.txt keys (render distance etc.): written on the next game launch, only if the game
-           *     already created options.txt, and only once per selection (so in-game changes are not overwritten).
+           * The numbers are starting points chosen by reasoning. They are NOT measured on any phone. The stability
+           * report written by StabilityMonitor records the preset and GC mode, so runs can be compared (A/B).
+           *
+           * game options.txt keys are written on the next game launch, only if the game already created options.txt,
+           * and only once per selection (so in-game changes are not overwritten).
            */
           object PerformancePreset {
               const val AUTO = "auto"
@@ -567,13 +737,18 @@ jobs:
               const val MAX_FPS = "max_fps"
               const val CUSTOM = "custom"
 
+              const val GC_DEFAULT = "default"
+              const val GC_SERIAL = "serial"
+              const val GC_G1_LIGHT = "g1light"
+
               private val presetUnit = StringSettingUnit("lumenPreset", CUSTOM)
               private val effectiveUnit = StringSettingUnit("lumenPresetEffective", CUSTOM)
               private val stampUnit = StringSettingUnit("lumenPresetStamp", "0")
+              private val resFixUnit = StringSettingUnit("lumenResFix1", "0")
+              private val gcUnit = StringSettingUnit("lumenGcMode", GC_DEFAULT)
 
               private class Spec(
                   val label: String,
-                  val resolution: Int,
                   val vsync: Boolean,
                   val renderDistance: Int,
                   val simulationDistance: Int,
@@ -583,12 +758,12 @@ jobs:
                   val maxFps: Int
               )
 
-              // label, render scale %, V-Sync, render dist, simulation dist, particles (0 all..2 minimal),
+              // label, V-Sync, render dist, simulation dist, particles (0 all..2 minimal),
               // graphicsMode (0 fast), biome blend, max fps (260 = unlimited)
               private val specs: Map<String, Spec> = mapOf(
-                  STABLE to Spec("Stable", 75, true, 6, 5, 2, 0, 1, 120),
-                  BALANCED to Spec("Balanced", 90, true, 8, 6, 1, 0, 2, 120),
-                  MAX_FPS to Spec("Max FPS", 60, false, 4, 5, 2, 0, 0, 260)
+                  STABLE to Spec("Stable", true, 6, 5, 2, 0, 1, 120),
+                  BALANCED to Spec("Balanced", true, 8, 6, 1, 0, 2, 120),
+                  MAX_FPS to Spec("Max FPS", false, 4, 5, 2, 0, 0, 260)
               )
 
               private fun totalRamMb(context: Context): Long {
@@ -608,12 +783,13 @@ jobs:
                   return specs[key]?.label ?: "Custom (mere settings)"
               }
 
-              /** One line for the stability report header, so every A/B run records what was active. */
+              /** Lines for the stability report header, so every A/B run records what was active. */
               @JvmStatic
               fun currentLabel(): String =
                   "Preset: " + presetUnit.getValue() + " (effective: " + effectiveUnit.getValue() + ")" +
                       ", render scale " + AllSettings.resolutionRatio.getValue() + "%" +
-                      ", force V-Sync " + AllSettings.forceVsync.getValue()
+                      ", force V-Sync " + AllSettings.forceVsync.getValue() +
+                      ", GC mode " + gcUnit.getValue()
 
               fun applyPreset(context: Context, key: String) {
                   val effective = if (key == AUTO) suggestedKey(context) else key
@@ -622,17 +798,37 @@ jobs:
                       .put(effectiveUnit, effective)
                       .put(stampUnit, System.currentTimeMillis().toString())
                   if (spec != null) {
-                      builder.put(AllSettings.resolutionRatio, spec.resolution)
-                          .put(AllSettings.forceVsync, spec.vsync)
+                      builder.put(AllSettings.forceVsync, spec.vsync)
                   }
                   builder.save()
-                  if (spec != null) AllStaticSettings.scaleFactor = spec.resolution / 100f
+              }
+
+              /**
+               * The first Lumen build lowered the render scale to 75 / 90 / 60 percent when a preset was chosen.
+               * Undo that exactly once: only when a preset was active and the scale still has one of those values.
+               */
+              @JvmStatic
+              fun restoreResolutionOnce() {
+                  try {
+                      if (resFixUnit.getValue() == "1") return
+                      val builder = resFixUnit.put("1")
+                      val old = AllSettings.resolutionRatio.getValue()
+                      if (presetUnit.getValue() != CUSTOM && (old == 75 || old == 90 || old == 60)) {
+                          builder.put(AllSettings.resolutionRatio, 100)
+                          AllStaticSettings.scaleFactor = 1f
+                          Logging.i("PerformancePreset", "Render scale restored $old -> 100")
+                      }
+                      builder.save()
+                  } catch (e: Exception) {
+                      Logging.e("PerformancePreset", "restoreResolutionOnce failed", e)
+                  }
               }
 
               /** Called from LaunchArgs on every launch. Never throws. */
               @JvmStatic
               fun applyGameOptions(gameDir: File) {
                   try {
+                      restoreResolutionOnce()
                       if (presetUnit.getValue() == CUSTOM) return
                       val spec = specs[effectiveUnit.getValue()] ?: return
                       val wanted = presetUnit.getValue() + "#" + stampUnit.getValue()
@@ -664,11 +860,25 @@ jobs:
                   }
               }
 
+              /** Extra JVM flags for the chosen GC mode (empty = JDK default, nothing changes). */
+              @JvmStatic
+              fun extraJvmArgs(): Array<String> = when (gcUnit.getValue()) {
+                  GC_SERIAL -> arrayOf("-XX:+UseSerialGC")
+                  GC_G1_LIGHT -> arrayOf("-XX:+UseG1GC", "-XX:ParallelGCThreads=2", "-XX:ConcGCThreads=1")
+                  else -> emptyArray<String>()
+              }
+
+              fun gcModeText(): String = when (gcUnit.getValue()) {
+                  GC_SERIAL -> "Serial GC"
+                  GC_G1_LIGHT -> "G1 light (2 GC threads)"
+                  else -> "Default (JDK)"
+              }
+
               private fun summary(context: Context, key: String): String {
                   if (key == CUSTOM) return "Custom: koi preset nahi lagega, tumhare settings jaise hain waise rahenge."
                   val effective = if (key == AUTO) suggestedKey(context) else key
                   val s = specs[effective] ?: return "Preset set ho gaya."
-                  return s.label + ": render scale " + s.resolution + "%, V-Sync " + (if (s.vsync) "ON" else "OFF") +
+                  return s.label + ": resolution NAHI badalta. V-Sync " + (if (s.vsync) "ON" else "OFF") +
                       ". Game options (render distance " + s.renderDistance +
                       " etc.) agle game launch se lagte hain, agar options.txt pehle se ban chuki ho."
               }
@@ -686,7 +896,7 @@ jobs:
                   val index = keys.indexOf(presetUnit.getValue())
                   val current = if (index < 0) keys.size - 1 else index
                   AlertDialog.Builder(activity, R.style.CustomAlertDialogTheme)
-                      .setTitle("Performance preset")
+                      .setTitle("Performance preset (resolution same rehta hai)")
                       .setSingleChoiceItems(labels, current) { dialog, which ->
                           applyPreset(activity, keys[which])
                           Toast.makeText(activity, summary(activity, keys[which]), Toast.LENGTH_LONG).show()
@@ -696,27 +906,904 @@ jobs:
                       .setPositiveButton(android.R.string.cancel, null)
                       .show()
               }
+
+              fun showGcPicker(activity: Activity, onChanged: () -> Unit) {
+                  val keys = arrayOf(GC_DEFAULT, GC_SERIAL, GC_G1_LIGHT)
+                  val labels = arrayOf(
+                      "Default (JDK): jaisa abhi chal raha hai",
+                      "Serial GC: GC threads nahi, kam CPU contention (test karo)",
+                      "G1 light: sirf 2 GC threads (test karo)"
+                  )
+                  val index = keys.indexOf(gcUnit.getValue())
+                  val current = if (index < 0) 0 else index
+                  AlertDialog.Builder(activity, R.style.CustomAlertDialogTheme)
+                      .setTitle("JVM GC mode (agle game launch se)")
+                      .setSingleChoiceItems(labels, current) { dialog, which ->
+                          gcUnit.put(keys[which]).save()
+                          Toast.makeText(
+                              activity,
+                              "GC mode: " + labels[which] + ". Kaam kare ya nahi, ye stability report se compare karo.",
+                              Toast.LENGTH_LONG
+                          ).show()
+                          dialog.dismiss()
+                          onChanged()
+                      }
+                      .setPositiveButton(android.R.string.cancel, null)
+                      .show()
+              }
           }
+          D6300_EOF
+          mkdir -p ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/lumen
+          cat > ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/lumen/LumenAppearance.kt <<'D6300_EOF'
+          package com.movtery.zalithlauncher.feature.lumen
+
+          import android.content.Context
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.widget.Toast
+          import com.movtery.zalithlauncher.event.single.MainBackgroundChangeEvent
+          import com.movtery.zalithlauncher.feature.background.BackgroundManager
+          import com.movtery.zalithlauncher.feature.background.BackgroundType
+          import com.movtery.zalithlauncher.feature.log.Logging
+          import com.movtery.zalithlauncher.utils.path.PathManager
+          import org.greenrobot.eventbus.EventBus
+          import java.io.File
+          import java.util.EnumMap
+
+          /**
+           * One-tap wallpaper for the main menu: the gallery opens, the chosen picture is copied into the
+           * launcher's background folder and selected as MAIN_MENU background (the same mechanism as
+           * Settings -> Custom background, just without the two extra steps).
+           */
+          object LumenAppearance {
+              private const val TAG = "LumenAppearance"
+              private const val PREFIX = "lumen_wallpaper_"
+
+              private fun toast(context: Context, text: String) {
+                  Handler(Looper.getMainLooper()).post {
+                      try {
+                          Toast.makeText(context.applicationContext, text, Toast.LENGTH_LONG).show()
+                      } catch (t: Throwable) {
+                          // best effort only
+                      }
+                  }
+              }
+
+              /** The background change event must be posted on the UI thread (the receiver touches views). */
+              private fun notifyChanged() {
+                  Handler(Looper.getMainLooper()).post {
+                      EventBus.getDefault().post(MainBackgroundChangeEvent())
+                  }
+              }
+
+              private fun currentMap(): EnumMap<BackgroundType, String> {
+                  val map = EnumMap<BackgroundType, String>(BackgroundType::class.java)
+                  val props = BackgroundManager.properties
+                  for (type in BackgroundType.values()) {
+                      val value = props[type.name] as String?
+                      if (value != null && value != BackgroundManager.NULL) map[type] = value
+                  }
+                  return map
+              }
+
+              @JvmStatic
+              fun onWallpaperPicked(context: Context?, uri: Uri?) {
+                  if (context == null || uri == null) return
+                  val app = context.applicationContext
+                  Thread {
+                      try {
+                          val dir = PathManager.DIR_BACKGROUND
+                          if (!dir.exists()) dir.mkdirs()
+                          val mime = app.contentResolver.getType(uri) ?: ""
+                          val ext = when {
+                              mime.contains("png") -> "png"
+                              mime.contains("webp") -> "webp"
+                              else -> "jpg"
+                          }
+                          val target = File(dir, PREFIX + System.currentTimeMillis() + "." + ext)
+                          val input = app.contentResolver.openInputStream(uri)
+                          if (input == null) {
+                              toast(app, "Image khul nahi payi.")
+                              return@Thread
+                          }
+                          input.use { src -> target.outputStream().use { out -> src.copyTo(out) } }
+
+                          val bounds = BitmapFactory.Options()
+                          bounds.inJustDecodeBounds = true
+                          BitmapFactory.decodeFile(target.absolutePath, bounds)
+                          if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                              target.delete()
+                              toast(app, "Ye image file nahi lagti (JPG / PNG / WEBP chuno).")
+                              return@Thread
+                          }
+
+                          val map = currentMap()
+                          map[BackgroundType.MAIN_MENU] = target.name
+                          BackgroundManager.saveProperties(map)
+
+                          // remove older wallpapers picked this way (unique names also keep Glide's cache fresh)
+                          val old = dir.listFiles()
+                          if (old != null) {
+                              for (f in old) {
+                                  if (f.name.startsWith(PREFIX) && f.name != target.name) f.delete()
+                              }
+                          }
+                          notifyChanged()
+                          toast(app, "Wallpaper lag gaya. Hatane ke liye Wallpaper button ko dabaye rakho.")
+                      } catch (t: Throwable) {
+                          Logging.e(TAG, "Could not set wallpaper", t)
+                          toast(app, "Wallpaper set nahi hua: " + t.javaClass.simpleName)
+                      }
+                  }.start()
+              }
+
+              @JvmStatic
+              fun clearWallpaper(context: Context?) {
+                  if (context == null) return
+                  val app = context.applicationContext
+                  Thread {
+                      try {
+                          val map = currentMap()
+                          map.remove(BackgroundType.MAIN_MENU)
+                          BackgroundManager.saveProperties(map)
+                          notifyChanged()
+                          toast(app, "Wallpaper hata diya (default glass background).")
+                      } catch (t: Throwable) {
+                          Logging.e(TAG, "Could not clear wallpaper", t)
+                      }
+                  }.start()
+              }
+          }
+          D6300_EOF
+          mkdir -p ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/lumen
+          cat > ZalithLauncher/src/main/java/com/movtery/zalithlauncher/feature/lumen/LumenSkin.kt <<'D6300_EOF'
+          package com.movtery.zalithlauncher.feature.lumen
+
+          import android.app.Activity
+          import android.content.Context
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.widget.Toast
+          import com.movtery.zalithlauncher.event.single.AccountUpdateEvent
+          import com.movtery.zalithlauncher.feature.accounts.AccountUtils
+          import com.movtery.zalithlauncher.feature.accounts.AccountUtils.Companion.isMicrosoftAccount
+          import com.movtery.zalithlauncher.feature.accounts.AccountUtils.Companion.isNoLoginRequired
+          import com.movtery.zalithlauncher.feature.accounts.AccountsManager
+          import com.movtery.zalithlauncher.feature.log.Logging
+          import com.movtery.zalithlauncher.utils.path.PathManager
+          import com.movtery.zalithlauncher.utils.path.UrlManager
+          import net.kdt.pojavlaunch.authenticator.listener.DoneListener
+          import net.kdt.pojavlaunch.authenticator.listener.ErrorListener
+          import net.kdt.pojavlaunch.value.MinecraftAccount
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.MultipartBody
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.greenrobot.eventbus.EventBus
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipOutputStream
+
+          /**
+           * Skin from the launcher: the gallery opens, the picked 64x64 PNG is applied.
+           *
+           *  - Microsoft account: uploaded to Mojang (POST api.minecraftservices.com/minecraft/profile/skins),
+           *    so every server and every game version shows it.
+           *  - Local (offline) account: the game has no skin server, so a small resource pack
+           *    ("LumenSkin.zip") that replaces the default player skins is generated in the game folder on every
+           *    launch and enabled in options.txt. Experimental: it relies on the default skin file paths of
+           *    Minecraft 1.19.3+ (stored separately for the wide and slim model) and on options.txt already existing.
+           */
+          object LumenSkin {
+              private const val TAG = "LumenSkin"
+              private const val PACK_NAME = "LumenSkin.zip"
+              private const val ENDPOINT = "https://api.minecraftservices.com/minecraft/profile/skins"
+              private const val MCMETA =
+                  "{\"pack\":{\"description\":\"Lumen local skin\",\"pack_format\":46," +
+                      "\"supported_formats\":{\"min_inclusive\":1,\"max_inclusive\":999}," +
+                      "\"min_format\":1,\"max_format\":999}}"
+              private val DEFAULT_SKIN_NAMES = listOf("alex", "ari", "efe", "kai", "makena", "noor", "steve", "sunny", "zuri")
+
+              private fun toast(context: Context, text: String) {
+                  Handler(Looper.getMainLooper()).post {
+                      try {
+                          Toast.makeText(context.applicationContext, text, Toast.LENGTH_LONG).show()
+                      } catch (t: Throwable) {
+                          // best effort only
+                      }
+                  }
+              }
+
+              private fun skinFile(account: MinecraftAccount) = File(PathManager.DIR_USER_SKIN, account.uniqueUUID + ".png")
+              private fun modelFile(account: MinecraftAccount) = File(PathManager.DIR_USER_SKIN, account.uniqueUUID + ".lumen")
+
+              /** Slim (Alex) skins leave the last column of the right arm back face transparent. */
+              private fun detectSlim(png: ByteArray): Boolean {
+                  val bmp = BitmapFactory.decodeByteArray(png, 0, png.size) ?: return false
+                  var slim = true
+                  for (y in 20..31) {
+                      if (Color.alpha(bmp.getPixel(55, y)) != 0) {
+                          slim = false
+                          break
+                      }
+                  }
+                  return slim
+              }
+
+              @JvmStatic
+              fun onSkinPicked(activity: Activity?, uri: Uri?) {
+                  if (activity == null || uri == null) return
+                  val app = activity.applicationContext
+                  Thread {
+                      try {
+                          val input = app.contentResolver.openInputStream(uri)
+                          if (input == null) {
+                              toast(app, "Skin file khul nahi payi.")
+                              return@Thread
+                          }
+                          val png = input.use { it.readBytes() }
+                          if (png.size > 1_000_000) {
+                              toast(app, "File bahut badi hai. Skin PNG chahiye (64x64).")
+                              return@Thread
+                          }
+                          val bounds = BitmapFactory.Options()
+                          bounds.inJustDecodeBounds = true
+                          BitmapFactory.decodeByteArray(png, 0, png.size, bounds)
+                          if (bounds.outWidth != 64 || bounds.outHeight != 64) {
+                              toast(
+                                  app,
+                                  "Skin PNG 64x64 honi chahiye. Tumhari image " + bounds.outWidth + "x" + bounds.outHeight +
+                                      " hai (64x32 purani skin ko 64x64 me badalna padega)."
+                              )
+                              return@Thread
+                          }
+                          val slim = detectSlim(png)
+                          val account = AccountsManager.currentAccount
+                          if (account == null) {
+                              toast(app, "Pehle account banao / chuno, phir skin lagao.")
+                              return@Thread
+                          }
+                          when {
+                              isMicrosoftAccount(account) -> uploadMicrosoft(activity, account, png, slim, true)
+                              isNoLoginRequired(account) -> saveLocal(app, account, png, slim)
+                              else -> toast(app, "Is account type (third-party login) ke liye skin upload abhi support nahi hai.")
+                          }
+                      } catch (t: Throwable) {
+                          Logging.e(TAG, "Skin pick failed", t)
+                          toast(app, "Skin lagane me error: " + t.javaClass.simpleName)
+                      }
+                  }.start()
+              }
+
+              private fun saveLocalCopy(account: MinecraftAccount, png: ByteArray, slim: Boolean) {
+                  val dir = PathManager.DIR_USER_SKIN
+                  if (!dir.exists()) dir.mkdirs()
+                  skinFile(account).writeBytes(png)
+                  modelFile(account).writeText(if (slim) "slim" else "classic")
+                  Handler(Looper.getMainLooper()).post {
+                      EventBus.getDefault().post(AccountUpdateEvent())
+                  }
+              }
+
+              private fun saveLocal(app: Context, account: MinecraftAccount, png: ByteArray, slim: Boolean) {
+                  saveLocalCopy(account, png, slim)
+                  toast(
+                      app,
+                      "Local skin save ho gayi (" + (if (slim) "slim" else "classic") +
+                          "). Agle game launch pe lagegi, agar game ne options.txt pehle bana li ho (ek baar game khol chuke ho)."
+                  )
+              }
+
+              private fun postSkin(token: String, png: ByteArray, slim: Boolean): Int {
+                  val body = MultipartBody.Builder()
+                      .setType(MultipartBody.FORM)
+                      .addFormDataPart("variant", if (slim) "slim" else "classic")
+                      .addFormDataPart("file", "skin.png", png.toRequestBody("image/png".toMediaType()))
+                      .build()
+                  val request = Request.Builder()
+                      .url(ENDPOINT)
+                      .header("Authorization", "Bearer $token")
+                      .post(body)
+                      .build()
+                  return UrlManager.createOkHttpClient().newCall(request).execute().use { response -> response.code }
+              }
+
+              /** Runs on a worker thread. Retries once after refreshing the Microsoft login when the token was rejected. */
+              private fun uploadMicrosoft(activity: Activity, account: MinecraftAccount, png: ByteArray, slim: Boolean, firstTry: Boolean) {
+                  val app = activity.applicationContext
+                  val code = try {
+                      postSkin(account.accessToken, png, slim)
+                  } catch (t: Throwable) {
+                      Logging.e(TAG, "Skin upload failed", t)
+                      toast(app, "Internet / upload error: " + t.javaClass.simpleName)
+                      return
+                  }
+                  when {
+                      code in 200..299 -> {
+                          saveLocalCopy(account, png, slim)
+                          toast(app, "Skin Microsoft account pe upload ho gayi (" + (if (slim) "slim" else "classic") + "). Game me rejoin karo.")
+                      }
+                      (code == 401 || code == 403) && firstTry -> {
+                          toast(app, "Login refresh kar raha hoon, phir skin dobara bhejunga...")
+                          AccountUtils.microsoftLogin(
+                              activity,
+                              account,
+                              DoneListener { fresh -> Thread { uploadMicrosoft(activity, fresh, png, slim, false) }.start() },
+                              ErrorListener { _ -> toast(app, "Microsoft login refresh fail. Account me dobara login karo.") }
+                          )
+                      }
+                      else -> toast(app, "Mojang ne skin reject ki (HTTP $code). Account login dobara karke try karo.")
+                  }
+              }
+
+              // ---- local (offline) accounts: resource pack ----------------------------------------
+
+              /** Called from LaunchArgs before every launch. Never throws. */
+              @JvmStatic
+              fun prepareLocalSkinPack(account: MinecraftAccount, gameDir: File) {
+                  try {
+                      if (!isNoLoginRequired(account)) return
+                      val skin = skinFile(account)
+                      if (!skin.isFile || !modelFile(account).isFile) return // only skins chosen through Lumen
+                      val png = skin.readBytes()
+                      val packDir = File(gameDir, "resourcepacks")
+                      packDir.mkdirs()
+                      ZipOutputStream(FileOutputStream(File(packDir, PACK_NAME))).use { zip ->
+                          fun put(path: String, data: ByteArray) {
+                              zip.putNextEntry(ZipEntry(path))
+                              zip.write(data)
+                              zip.closeEntry()
+                          }
+                          put("pack.mcmeta", MCMETA.toByteArray(Charsets.UTF_8))
+                          for (name in DEFAULT_SKIN_NAMES) {
+                              put("assets/minecraft/textures/entity/player/wide/$name.png", png)
+                              put("assets/minecraft/textures/entity/player/slim/$name.png", png)
+                          }
+                          // pre-1.19.3 locations
+                          put("assets/minecraft/textures/entity/steve.png", png)
+                          put("assets/minecraft/textures/entity/alex.png", png)
+                      }
+                      enableInOptions(gameDir)
+                  } catch (t: Throwable) {
+                      Logging.e(TAG, "Could not prepare local skin pack", t)
+                  }
+              }
+
+              private fun enableInOptions(gameDir: File) {
+                  val options = File(gameDir, "options.txt")
+                  if (!options.isFile) return
+                  val entry = "\"file/$PACK_NAME\""
+                  val lines = options.readLines().toMutableList()
+                  val idx = lines.indexOfFirst { it.startsWith("resourcePacks:") }
+                  if (idx < 0) {
+                      lines.add("resourcePacks:[\"vanilla\",$entry]")
+                  } else {
+                      val line = lines[idx]
+                      if (line.contains(entry)) return
+                      val open = line.indexOf('[')
+                      val close = line.lastIndexOf(']')
+                      if (open < 0 || close < open) return
+                      val inner = line.substring(open + 1, close).trim()
+                      lines[idx] = "resourcePacks:[" + (if (inner.isEmpty()) "" else "$inner,") + entry + "]"
+                  }
+                  options.writeText(lines.joinToString("\n") + "\n")
+              }
+          }
+          D6300_EOF
+          mkdir -p .
+          cat > lumen_logo_fg.b64 <<'D6300_EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAbAAAAGwCAYAAADITjAqAABppklEQVR42u2dd5RkZ3Xtd6VO05M1
+          ytIoDgJJSEgIgcgiChEMMmAMNg4EGdsPeOb5PdtgY3B85jnggHEAbIxtHAjGgDFRJgkDiiChnEca
+          Te5c4d77/jjnW73n6FZ3dVfNTM/M/q3Va3qqq6tu3ar+9j3n2+ccQAghhBBCCCGEEEIIIYQQQggh
+          hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQ
+          QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII
+          IYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGE
+          EEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC
+          CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh
+          hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQ
+          QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII
+          IYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGE
+          EEIIIYQQQgghhBBC7G9qOgXiMKUO4FwAPwzgRQBOBjAMoAqgBSA7RF/XUQC2ANgAoAAwM+DHr/q6
+          0PDvc32UxEqlolMgDnMaAM4A8GMAXgqgA+B2AFsB3AfgVgB3ALgTwPSAF+yaC87JLjZbAewG0Ozz
+          eU4CcAKAtj/mQ/74gxT/mh9jfgiLvZCACXHYfNbXAXgWgDcBeKbf/iCAKQA/cDG7zr+/B8CuASze
+          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
+          Zspo4+BcVDbC32esFZOZQwgJmNiPQnY0rDnu0b4ofx22LzTo5xmn59nk/653UVtLwlWj+VoZuRtr
+          5AhM3eNH/Vg/Dxsbs+cgiUWFxLUsApOACQmYEPvx87UB1sB3PaybxYMHKIoZcXE7DlbgfDws9TiM
+          fR2KGbWC6vjtoLEoLdhe3rdhRdezK+DvVcIlhARMHEBGXURyDHbC8lI/76l58GqP0k7wCO44j9iG
+          SMSaVGfWgtnk7/Ljv/cA7pcJISRgAivDOLTSukhUKF2XWlRthNnt09eY374K8zVfN/q/E1TbJYSQ
+          gAmxYmiQuA155Ha0fzVgBpW7YY7LqYNk/hBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC
+          CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh
+          hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQ
+          QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII
+          IYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGE
+          EEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC
+          CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh
+          hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQ
+          QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII
+          IYQQQgDA/wdMAxOE0HeWFQAAAABJRU5ErkJggg==
           D6300_EOF
           mkdir -p .
           cat > apply_d6300.py <<'D6300_EOF'
           #!/usr/bin/env python3
-          """Apply the Zalith D6300 patch to a checkout of ZalithLauncher/ZalithLauncher.
+          """Apply the Lumen Launcher patch to a checkout of ZalithLauncher/ZalithLauncher.
 
           Run from the repository root. Every edit asserts that its anchor text exists exactly
           once, so the script fails loudly instead of silently producing a half-patched tree.
 
           Edits:
             1. defaults in AllSettings.kt  (stability-oriented defaults for low-end Mali phones)
-            2. MainActivity.java            (start/stop the StabilityMonitor)
-            3. gradle.properties            (app label, so it is easy to tell apart)
+            2. MainActivity.java           (start/stop the StabilityMonitor)
+            2b. LaunchArgs.kt              (Minecraft 26.x native-dir fix)
+            2c. presets + GC mode + local skin hook (LaunchArgs.kt, Video settings screen)
+            2d. Tools.java                 (missing client jar of inheriting versions, e.g. "26.3 Fabric")
+            3. app label
+            4. glass theme (colors, drawables, top bar, scrim, default background)
+            5. main menu: Skin + Wallpaper buttons
+            6. app icon (red dragon)
           The new Kotlin files and the Rust crate are written by the workflow before this runs.
           """
+          import base64
           import pathlib
+          import re
           import sys
 
           ROOT = pathlib.Path(".")
           MODULE = ROOT / "ZalithLauncher"
+          RES = MODULE / "src/main/res"
+          JAVA = MODULE / "src/main/java"
 
 
           def replace_once(path: pathlib.Path, old: str, new: str) -> None:
@@ -725,24 +1812,47 @@ jobs:
               if count != 1:
                   sys.exit(f"PATCH FAILED: expected 1 match in {path}, found {count} for: {old!r}")
               path.write_text(text.replace(old, new, 1), encoding="utf-8")
-              print(f"patched {path}: {old!r}")
+              print(f"patched {path}: {old[:70]!r}")
 
+
+          def write_file(path: pathlib.Path, content: str) -> None:
+              if not path.parent.is_dir():
+                  sys.exit(f"PATCH FAILED: directory missing for {path}")
+              path.write_text(content, encoding="utf-8")
+              print(f"wrote {path}")
+
+
+          def set_color(path: pathlib.Path, name: str, value: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              pattern = re.compile(r'(<color name="%s">)[^<]*(</color>)' % re.escape(name))
+              found = pattern.findall(text)
+              if len(found) != 1:
+                  sys.exit(f"PATCH FAILED: expected 1 <color name={name}> in {path}, found {len(found)}")
+              path.write_text(pattern.sub(lambda m: m.group(1) + value + m.group(2), text, count=1), encoding="utf-8")
+              print(f"color {path.name}: {name} = {value}")
+
+
+          def add_colors(path: pathlib.Path, items) -> None:
+              text = path.read_text(encoding="utf-8")
+              if text.count("</resources>") != 1:
+                  sys.exit(f"PATCH FAILED: expected one </resources> in {path}")
+              block = "".join(f'    <color name="{n}">{v}</color>\n' for n, v in items)
+              path.write_text(text.replace("</resources>", block + "</resources>", 1), encoding="utf-8")
+              print(f"added colors to {path.name}: {[n for n, _ in items]}")
+
+
+          PRESET = "com.movtery.zalithlauncher.feature.preset.PerformancePreset"
+          LUMEN = "com.movtery.zalithlauncher.feature.lumen"
 
           # 1. Defaults ---------------------------------------------------------------
-          settings = MODULE / "src/main/java/com/movtery/zalithlauncher/setting/AllSettings.kt"
-          for key, name in [
-              ("sustainedPerformance", "sustainedPerformance"),
-              ("alternate_surface", "alternate_surface"),
-              ("force_vsync", "force_vsync"),
-              ("gameMenuShowFPS", "gameMenuShowFPS"),
-              # (see comment below about bigCoreAffinity)
+          settings = JAVA / "com/movtery/zalithlauncher/setting/AllSettings.kt"
+          for key in ["sustainedPerformance", "alternate_surface", "force_vsync", "gameMenuShowFPS"]:
               # bigCoreAffinity is deliberately NOT changed: at this upstream commit the env var
               # POJAV_BIG_CORE_AFFINITY is set but nothing in the native code reads it.
-          ]:
               replace_once(settings, f'BooleanSettingUnit("{key}", false)', f'BooleanSettingUnit("{key}", true)')
 
           # 2. MainActivity hooks -------------------------------------------------------
-          main = MODULE / "src/main/java/net/kdt/pojavlaunch/MainActivity.java"
+          main = JAVA / "net/kdt/pojavlaunch/MainActivity.java"
           replace_once(
               main,
               "import org.greenrobot.eventbus.EventBus;\n",
@@ -778,7 +1888,7 @@ jobs:
           # The same log also shows a second -Djava.library.path (.../lib/arm64/java) that overrides the
           # launcher's own one. Zalith Launcher 2 fixes both the same way (redirect to cache dir / force
           # java.library.path to natives_directory), see its LaunchArgs.kt.
-          launch_args = MODULE / "src/main/java/com/movtery/zalithlauncher/launch/LaunchArgs.kt"
+          launch_args = JAVA / "com/movtery/zalithlauncher/launch/LaunchArgs.kt"
           replace_once(
               launch_args,
               "        return JSONUtils.insertJSONValueList(minecraftArgs.toTypedArray<String>(), varArgMap)\n",
@@ -807,60 +1917,119 @@ jobs:
           ''',
           )
 
-          # 2c. Performance presets ---------------------------------------------------------
-          # New file PerformancePreset.kt is written by the workflow. Hooks:
-          #   - launch: write preset game options (options.txt) once per selection
-          #   - Video settings: one new row "Performance preset" that opens a picker dialog
+          # 2c. Performance presets, GC mode, local skin pack ----------------------------------
+          # New files PerformancePreset.kt / LumenSkin.kt / LumenAppearance.kt are written by the workflow.
+          #   - launch: write preset game options once per selection, prepare the local skin pack, add GC flags
+          #   - Video settings: two rows ("Performance preset", "JVM GC mode") that open picker dialogs
           replace_once(
               launch_args,
               "        argsList.addAll(getJavaArgs())\n",
-              "        com.movtery.zalithlauncher.feature.preset.PerformancePreset.applyGameOptions(gameDirPath)\n"
-              "        argsList.addAll(getJavaArgs())\n",
+              f"        {PRESET}.applyGameOptions(gameDirPath)\n"
+              f"        {LUMEN}.LumenSkin.prepareLocalSkinPack(account, gameDirPath)\n"
+              "        argsList.addAll(getJavaArgs())\n"
+              f"        argsList.addAll({PRESET}.extraJvmArgs().toList())\n",
           )
 
-          video_layout = MODULE / "src/main/res/layout/settings_fragment_video.xml"
-          renderer_row_anchor = (
-              '            <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout\n'
-              '                android:id="@+id/renderer_layout"\n'
-          )
-          preset_row = '''            <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout
-                          android:id="@+id/preset_layout"
+
+          def video_row(prefix: str, title: str, default: str) -> str:
+              return f'''            <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout
+                          android:id="@+id/{prefix}_layout"
                           android:layout_width="match_parent"
                           android:layout_height="wrap_content"
                           android:background="?android:attr/selectableItemBackground"
                           android:padding="@dimen/_12sdp">
 
                           <TextView
-                              android:id="@+id/preset_title"
+                              android:id="@+id/{prefix}_title"
                               android:layout_width="wrap_content"
                               android:layout_height="wrap_content"
                               android:layout_alignParentStart="true"
-                              android:text="Performance preset"
+                              android:text="{title}"
                               android:textColor="@color/black_or_white" />
 
                           <TextView
-                              android:id="@+id/preset_value"
+                              android:id="@+id/{prefix}_value"
                               android:layout_width="match_parent"
                               android:layout_height="wrap_content"
-                              android:layout_below="@+id/preset_title"
-                              android:text="Custom" />
+                              android:layout_below="@+id/{prefix}_title"
+                              android:text="{default}" />
                       </com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout>
 
           '''
-          replace_once(video_layout, renderer_row_anchor, preset_row + renderer_row_anchor)
 
-          video_fragment = MODULE / "src/main/java/com/movtery/zalithlauncher/ui/fragment/settings/VideoSettingsFragment.kt"
+
+          video_layout = RES / "layout/settings_fragment_video.xml"
+          renderer_row_anchor = (
+              '            <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout\n'
+              '                android:id="@+id/renderer_layout"\n'
+          )
+          replace_once(
+              video_layout,
+              renderer_row_anchor,
+              video_row("preset", "Performance preset (resolution same rehta hai)", "Custom")
+              + video_row("gc", "JVM GC mode (A/B test)", "Default (JDK)")
+              + renderer_row_anchor,
+          )
+
+          video_fragment = JAVA / "com/movtery/zalithlauncher/ui/fragment/settings/VideoSettingsFragment.kt"
           replace_once(
               video_fragment,
               "        val renderers = Renderers.getCompatibleRenderers(context).first\n",
-              "        binding.presetValue.text = com.movtery.zalithlauncher.feature.preset.PerformancePreset.valueText(context)\n"
+              f"        binding.presetValue.text = {PRESET}.valueText(context)\n"
               "        binding.presetLayout.setOnClickListener {\n"
-              "            com.movtery.zalithlauncher.feature.preset.PerformancePreset.showPicker(context) {\n"
-              "                binding.presetValue.text = com.movtery.zalithlauncher.feature.preset.PerformancePreset.valueText(context)\n"
+              f"            {PRESET}.showPicker(context) {{\n"
+              f"                binding.presetValue.text = {PRESET}.valueText(context)\n"
+              "            }\n"
+              "        }\n"
+              f"        binding.gcValue.text = {PRESET}.gcModeText()\n"
+              "        binding.gcLayout.setOnClickListener {\n"
+              f"            {PRESET}.showGcPicker(context) {{\n"
+              f"                binding.gcValue.text = {PRESET}.gcModeText()\n"
               "            }\n"
               "        }\n"
               "\n"
               "        val renderers = Renderers.getCompatibleRenderers(context).first\n",
+          )
+
+          # 2d. Missing client jar of inheriting versions (e.g. "26.3 Fabric") --------------------
+          # Evidence (user's latestlog.txt): Fabric aborted with "Class path entries reference missing files:
+          # .../versions/26.3 Fabric/26.3 Fabric.jar" -> "Minecraft game provider couldn't locate the game".
+          # Zalith copies the parent jar into the child folder inside MinecraftDownloader.ensureJarFileCopy(),
+          # but the logs of that launch contain no "Copying ..." line, so the copy did not happen (reason not
+          # visible in the logs). Self-heal: right before the class path is built, copy the parent's jar if the
+          # child's own jar is missing and the parent's jar exists. Does nothing in any other case.
+          tools_java = JAVA / "net/kdt/pojavlaunch/Tools.java"
+          replace_once(
+              tools_java,
+              "    public static String getClientClasspath(Version version) {\n"
+              "        return new File(version.getVersionPath(), version.getVersionName() + \".jar\").getAbsolutePath();\n"
+              "    }\n",
+              r'''    public static String getClientClasspath(Version version) {
+                  File clientJar = new File(version.getVersionPath(), version.getVersionName() + ".jar");
+                  lumenRepairClientJar(version, clientJar);
+                  return clientJar.getAbsolutePath();
+              }
+
+              /** Copies the parent version's jar into this version's folder when it is missing (never throws). */
+              private static void lumenRepairClientJar(Version version, File clientJar) {
+                  if (clientJar.isFile()) return;
+                  try {
+                      JMinecraftVersionList.Version info = GLOBAL_GSON.fromJson(
+                              read(new File(version.getVersionPath(), version.getVersionName() + ".json")),
+                              JMinecraftVersionList.Version.class);
+                      if (info == null || info.inheritsFrom == null || info.inheritsFrom.isEmpty()) return;
+                      File parentJar = new File(version.getVersionsFolder(), info.inheritsFrom + "/" + info.inheritsFrom + ".jar");
+                      if (parentJar.isFile() && parentJar.length() > 0) {
+                          org.apache.commons.io.FileUtils.copyFile(parentJar, clientJar, false);
+                          Logging.i("Lumen", "Copied " + parentJar.getAbsolutePath() + " -> " + clientJar.getAbsolutePath());
+                      } else {
+                          Logging.w("Lumen", "Parent jar missing too: " + parentJar.getAbsolutePath());
+                      }
+                  } catch (Throwable t) {
+                      Logging.w("Lumen", "Could not repair client jar", t);
+                  }
+              }
+          ''',
           )
 
           # 3. App label ----------------------------------------------------------------
@@ -870,7 +2039,324 @@ jobs:
               "launcher_app_name=Lumen Launcher\n",
           )
 
-          print("D6300 patch applied.")
+          # 4. Glass theme --------------------------------------------------------------
+          # Translucent panels + thin light border + faint top highlight. No per-frame blur (that costs GPU on
+          # Mali and would hurt UI smoothness); the "glass" comes from transparency over the wallpaper.
+          colors_day = RES / "values/colors.xml"
+          colors_night = RES / "values-night/colors_night.xml"
+          day = {
+              "background_menu_top": "#992D8B9C",
+              "button_background": "#80FFFFFF",
+              "button_background_selected": "#B3FFFFFF",
+              "dialog_background": "#F2F4F4F4",
+              "menu_bar": "#80FFFFFF",
+              "menu_overlay": "#99FFFFFF",
+              "background_item": "#80FFFFFF",
+              "background_item_selected": "#B3FFFFFF",
+              "background_item_disabled": "#80FFDADA",
+              "edit_box_fill": "#80FFFFFF",
+              "edit_box_fill_selected": "#B3FFFFFF",
+              "mod_category_fill": "#4DFFFFFF",
+              "text_background_fill": "#66FFFFFF",
+          }
+          night = {
+              "background_menu_top": "#66000000",
+              "button_background": "#66202028",
+              "button_background_selected": "#B3405060",
+              "dialog_background": "#F2121218",
+              "menu_bar": "#66000000",
+              "menu_overlay": "#8C000000",
+              "background_item": "#59000000",
+              "background_item_selected": "#8032A8B8",
+              "background_item_disabled": "#66803030",
+              "edit_box_fill": "#66000000",
+              "edit_box_fill_selected": "#80000000",
+              "mod_category_fill": "#4D000000",
+              "text_background_fill": "#66000000",
+          }
+          for name, value in day.items():
+              set_color(colors_day, name, value)
+          for name, value in night.items():
+              set_color(colors_night, name, value)
+          add_colors(
+              colors_day,
+              [
+                  ("lumen_glass_stroke", "#99FFFFFF"),
+                  ("lumen_glass_highlight_top", "#4DFFFFFF"),
+                  ("lumen_glass_highlight_bottom", "#0AFFFFFF"),
+                  ("lumen_scrim", "#14000000"),
+              ],
+          )
+          add_colors(
+              colors_night,
+              [
+                  ("lumen_glass_stroke", "#47FFFFFF"),
+                  ("lumen_glass_highlight_top", "#2EFFFFFF"),
+                  ("lumen_glass_highlight_bottom", "#05FFFFFF"),
+                  ("lumen_scrim", "#4D000000"),
+              ],
+          )
+
+
+          def glass_shape(radius: str, fill: str) -> str:
+              return f'''<?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item>
+                  <shape android:shape="rectangle">
+                      <corners android:radius="{radius}" />
+                      <solid android:color="@color/{fill}" />
+                  </shape>
+              </item>
+              <item>
+                  <shape android:shape="rectangle">
+                      <corners android:radius="{radius}" />
+                      <gradient
+                          android:angle="270"
+                          android:startColor="@color/lumen_glass_highlight_top"
+                          android:endColor="@color/lumen_glass_highlight_bottom" />
+                      <stroke android:width="1dp" android:color="@color/lumen_glass_stroke" />
+                  </shape>
+              </item>
+          </layer-list>
+          '''
+
+
+          drawable = RES / "drawable"
+          write_file(drawable / "background_item_unselected.xml", glass_shape("@dimen/_6sdp", "background_item"))
+          write_file(drawable / "background_item_selected.xml", glass_shape("@dimen/_6sdp", "background_item_selected"))
+          write_file(drawable / "background_item_disabled.xml", glass_shape("@dimen/_6sdp", "background_item_disabled"))
+          write_file(drawable / "background_card.xml", glass_shape("@dimen/_8sdp", "menu_overlay"))
+          write_file(
+              drawable / "dialog_background.xml",
+              '''<?xml version="1.0" encoding="utf-8"?>
+          <inset xmlns:android="http://schemas.android.com/apk/res/android">
+              <shape android:shape="rectangle">
+                  <corners android:radius="@dimen/_8sdp" />
+                  <solid android:color="@color/dialog_background" />
+                  <stroke android:width="1dp" android:color="@color/lumen_glass_stroke" />
+              </shape>
+          </inset>
+          ''',
+          )
+
+          # default background when no wallpaper is set (night: dark crimson, day: soft sky)
+          write_file(
+              drawable / "lumen_default_bg.xml",
+              '''<?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient
+                  android:angle="315"
+                  android:startColor="#FFCFE3EE"
+                  android:centerColor="#FFDCE0F0"
+                  android:endColor="#FFE9D5EC"
+                  android:type="linear" />
+          </shape>
+          ''',
+          )
+          night_drawable = RES / "drawable-night"
+          night_drawable.mkdir(exist_ok=True)
+          write_file(
+              night_drawable / "lumen_default_bg.xml",
+              '''<?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient
+                  android:angle="315"
+                  android:startColor="#FF0D0508"
+                  android:centerColor="#FF4A0E16"
+                  android:endColor="#FF1A0B26"
+                  android:type="linear" />
+          </shape>
+          ''',
+          )
+
+          replace_once(
+              JAVA / "com/movtery/zalithlauncher/feature/background/BackgroundManager.kt",
+              "        backgroundView.setImageDrawable(\n"
+              "            ContextCompat.getDrawable(context, R.color.background_app)\n"
+              "        )\n",
+              "        backgroundView.setImageDrawable(\n"
+              "            ContextCompat.getDrawable(\n"
+              "                context,\n"
+              "                if (backgroundType == BackgroundType.MAIN_MENU) R.drawable.lumen_default_bg else R.color.background_app\n"
+              "            )\n"
+              "        )\n",
+          )
+
+          # scrim over the wallpaper (keeps text readable on bright pictures)
+          replace_once(
+              RES / "layout/activity_launcher.xml",
+              '    <ImageView\n'
+              '        android:id="@+id/background_view"\n'
+              '        android:layout_width="match_parent"\n'
+              '        android:layout_height="match_parent"/>\n',
+              '    <ImageView\n'
+              '        android:id="@+id/background_view"\n'
+              '        android:layout_width="match_parent"\n'
+              '        android:layout_height="match_parent"\n'
+              '        android:foreground="@color/lumen_scrim"/>\n',
+          )
+
+          launcher_activity = JAVA / "net/kdt/pojavlaunch/LauncherActivity.java"
+          # translucent top bar tinted from the wallpaper
+          replace_once(
+              launcher_activity,
+              "                binding.topLayout.setBackgroundColor(\n"
+              "                        isDarkMode ?\n"
+              "                                palette.getDarkVibrantColor(backgroundMenuTop) :\n"
+              "                                palette.getLightVibrantColor(backgroundMenuTop)\n"
+              "                );\n",
+              "                binding.topLayout.setBackgroundColor(androidx.core.graphics.ColorUtils.setAlphaComponent(\n"
+              "                        isDarkMode ?\n"
+              "                                palette.getDarkVibrantColor(backgroundMenuTop) :\n"
+              "                                palette.getLightVibrantColor(backgroundMenuTop), 0x70));\n",
+          )
+          # undo the render-scale cut of the first Lumen presets (once)
+          replace_once(
+              launcher_activity,
+              "        mNotificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);\n",
+              "        mNotificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);\n"
+              f"        {PRESET}.restoreResolutionOnce();\n",
+          )
+
+          # 5. Main menu: Skin + Wallpaper buttons (under "Execute .jar file") --------------------
+          write_file(
+              drawable / "ic_lumen_skin.xml",
+              '''<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="@color/icon_color"
+                  android:pathData="M12,12c2.21,0 4,-1.79 4,-4s-1.79,-4 -4,-4 -4,1.79 -4,4 1.79,4 4,4zM12,14c-2.67,0 -8,1.34 -8,4v2h16v-2c0,-2.66 -5.33,-4 -8,-4z" />
+          </vector>
+          ''',
+          )
+          write_file(
+              drawable / "ic_lumen_wallpaper.xml",
+              '''<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="@color/icon_color"
+                  android:pathData="M21,19V5c0,-1.1 -0.9,-2 -2,-2H5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2zM8.5,13.5l2.5,3.01L14.5,12l4.5,6H5l3.5,-4.5z" />
+          </vector>
+          ''',
+          )
+
+
+          def menu_item(prefix: str, icon: str, label: str) -> str:
+              return f'''                <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout
+                              android:id="@+id/{prefix}_button"
+                              android:layout_width="match_parent"
+                              android:layout_height="wrap_content"
+                              android:layout_marginTop="@dimen/_12sdp"
+                              android:layout_marginStart="@dimen/_12sdp"
+                              android:layout_marginEnd="@dimen/_8sdp"
+                              android:background="@drawable/background_item"
+                              android:paddingHorizontal="@dimen/_8sdp"
+                              android:paddingVertical="@dimen/_12sdp"
+                              app:ripple_for_relative="true">
+
+                              <ImageView
+                                  android:id="@+id/{prefix}_icon"
+                                  android:layout_width="@dimen/_24sdp"
+                                  android:layout_height="@dimen/_24sdp"
+                                  android:layout_marginStart="@dimen/_8sdp"
+                                  android:layout_alignParentStart="true"
+                                  android:layout_centerVertical="true"
+                                  android:src="@drawable/{icon}"/>
+
+                              <TextView
+                                  android:layout_width="0dp"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginStart="@dimen/_16sdp"
+                                  android:layout_marginEnd="@dimen/_8sdp"
+                                  android:layout_alignParentEnd="true"
+                                  android:layout_centerVertical="true"
+                                  android:layout_toEndOf="@id/{prefix}_icon"
+                                  android:text="{label}"
+                                  android:textSize="@dimen/_12sdp"
+                                  android:textColor="@color/primary_text"/>
+
+                          </com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout>
+
+          '''
+
+
+          menu_layout = RES / "layout/fragment_launcher.xml"
+          share_anchor = (
+              '                <com.movtery.zalithlauncher.ui.layout.AnimRelativeLayout\n'
+              '                    android:id="@+id/share_logs_button"\n'
+          )
+          replace_once(
+              menu_layout,
+              share_anchor,
+              menu_item("skin", "ic_lumen_skin", "Skin (gallery se)")
+              + menu_item("wallpaper", "ic_lumen_wallpaper", "Wallpaper (gallery se)")
+              + share_anchor,
+          )
+          # drop the elevation shadows of the home-screen items (they show through translucent glass and cost overdraw)
+          menu_text = menu_layout.read_text(encoding="utf-8")
+          cleaned, removed = re.subn(r'\n[ \t]*android:translationZ="[^"]*"(?=\n)', "", menu_text)
+          if removed < 1:
+              sys.exit("PATCH FAILED: no translationZ removed in fragment_launcher.xml")
+          menu_layout.write_text(cleaned, encoding="utf-8")
+          print(f"removed {removed} translationZ attributes from fragment_launcher.xml")
+
+          menu_fragment = JAVA / "net/kdt/pojavlaunch/fragments/MainMenuFragment.java"
+          replace_once(
+              menu_fragment,
+              "    private AccountViewWrapper accountViewWrapper;\n",
+              "    private AccountViewWrapper accountViewWrapper;\n"
+              "    private final androidx.activity.result.ActivityResultLauncher<String> lumenWallpaperPicker =\n"
+              "            registerForActivityResult(new androidx.activity.result.contract.ActivityResultContracts.GetContent(),\n"
+              f"                    uri -> {LUMEN}.LumenAppearance.onWallpaperPicked(getContext(), uri));\n"
+              "    private final androidx.activity.result.ActivityResultLauncher<String> lumenSkinPicker =\n"
+              "            registerForActivityResult(new androidx.activity.result.contract.ActivityResultContracts.GetContent(),\n"
+              f"                    uri -> {LUMEN}.LumenSkin.onSkinPicked(getActivity(), uri));\n",
+          )
+          replace_once(
+              menu_fragment,
+              "        binding.shareLogsButton.setOnClickListener(v -> ZHTools.shareLogs(requireActivity()));\n",
+              "        binding.shareLogsButton.setOnClickListener(v -> ZHTools.shareLogs(requireActivity()));\n"
+              "        binding.skinButton.setOnClickListener(v -> lumenSkinPicker.launch(\"image/png\"));\n"
+              "        binding.wallpaperButton.setOnClickListener(v -> lumenWallpaperPicker.launch(\"image/*\"));\n"
+              "        binding.wallpaperButton.setOnLongClickListener(v -> {\n"
+              f"            {LUMEN}.LumenAppearance.clearWallpaper(getContext());\n"
+              "            return true;\n"
+              "        });\n",
+          )
+
+          # 6. App icon (red dragon logo) -----------------------------------------------------
+          # Foreground = black dragon on transparent (alpha taken from the supplied logo), background = red radial
+          # gradient. One xxxhdpi PNG is enough: the older density copies are removed so Android scales this one.
+          for old_fg in RES.glob("mipmap-*/ic_launcher_foreground.png"):
+              old_fg.unlink()
+              print(f"removed {old_fg}")
+          fg = base64.b64decode(pathlib.Path("lumen_logo_fg.b64").read_text())
+          if not fg.startswith(b"\x89PNG"):
+              sys.exit("PATCH FAILED: logo data is not a PNG")
+          (RES / "mipmap-xxxhdpi/ic_launcher_foreground.png").write_bytes(fg)
+          print(f"wrote logo foreground ({len(fg)} bytes)")
+          write_file(
+              drawable / "ic_launcher_background.xml",
+              '''<?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient
+                  android:type="radial"
+                  android:centerX="0.5"
+                  android:centerY="0.5"
+                  android:gradientRadius="75%p"
+                  android:startColor="#FFFF0A0A"
+                  android:endColor="#FF8A0000" />
+          </shape>
+          ''',
+          )
+
+          print("Lumen patch applied.")
           D6300_EOF
 
       - name: Apply D6300 patch
